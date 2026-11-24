@@ -13,7 +13,6 @@ use crate::util::hex;
 use crate::viewfn::{run_map_js, Builtin, Row, WRAPPER_SOURCE};
 use md5::{Digest, Md5};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -67,35 +66,26 @@ pub struct ViewSpec {
     pub partitioned: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredRow {
-    key: Value,
-    value: Value,
-}
-
-#[derive(Serialize)]
-struct StoredRowRef<'a> {
-    key: &'a Value,
-    value: &'a Value,
-}
-
 /// Page cache of each view file: fixed and small, since many can be open.
 const VIEW_CACHE_BYTES: usize = 4 << 20;
 
 // The tables of a view file. Every value is sealed (`kv::seal`), so a damaged
 // one is an error when read, never a wrong or missing row.
 
-/// (document id, ordinal) → one row the document emitted, as
-/// `{"key": …, "value": …}`. A document's rows sit together, so a changed
-/// document's old rows are found without walking the index.
+/// (document id, ordinal) → the `ViewKey` of one row the document emitted,
+/// whose value is in `view_store::BY_KEY`. A document's rows sit together,
+/// so a changed document's old rows are found, by their exact keys, without
+/// walking the index. The ordinal is the row's emit index in its document.
 const ROWS: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("rows");
 /// [`DESIGN`] → the signature of the map and reduce functions the rows were
-/// made with.
+/// made with, and of the key encoding, collation and placement they are
+/// ordered by; [`TOTALS`] → each shard's row count.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Shard number → `[uuid, seq]`: the shard copy the index has read, and how
 /// far (the [`IndexCursor`]).
 const CURSOR: TableDefinition<u32, &[u8]> = TableDefinition::new("cursor");
 const DESIGN: &str = "design";
+const TOTALS: &str = "totals";
 
 /// A persistent index for one (database, design document, view) tuple, in a
 /// redb file of its own. Rows are stored per document so a changed document
@@ -142,6 +132,17 @@ impl Placement {
 
     fn shard_of(&self, id: &str) -> usize {
         crate::db::shard_index_for(id, self.q, self.partitioned)
+    }
+
+    /// The partition part of a row's `ViewKey`: the document's run for a view
+    /// queried by partition, so each partition's rows are contiguous in its
+    /// shard; empty otherwise.
+    fn partition_of(&self, id: &str) -> String {
+        if self.by_partition {
+            run_name(id)
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -1642,23 +1643,84 @@ fn unsealed(stored: &[u8]) -> Result<&[u8], JsError> {
     crate::kv::unseal(stored).map_err(|corrupt| JsError::Index(format!("view index: {corrupt}")))
 }
 
-fn encode_row(row: &Row) -> Result<Vec<u8>, JsError> {
-    let encoded = serde_json::to_vec(&StoredRowRef {
-        key: &row.key,
-        value: &row.value,
-    })
-    .map_err(index_error)?;
-    Ok(crate::kv::seal(&encoded))
+/// A row's value as stored in `BY_KEY`.
+fn encode_value(value: &Value) -> Result<Vec<u8>, JsError> {
+    Ok(crate::kv::seal(
+        &serde_json::to_vec(value).map_err(index_error)?,
+    ))
 }
 
-fn decode_row(stored: &[u8]) -> Result<StoredRow, JsError> {
+fn decode_value(stored: &[u8]) -> Result<Value, JsError> {
     serde_json::from_slice(unsealed(stored)?).map_err(index_error)
+}
+
+/// Each shard's row count, as `TOTALS` records it (empty before the first
+/// rebuild).
+fn read_totals(txn: &WriteTransaction) -> Result<Vec<u64>, JsError> {
+    let meta = txn.open_table(META).map_err(index_error)?;
+    let stored = meta.get(TOTALS).map_err(index_error)?;
+    match stored {
+        Some(stored) => serde_json::from_slice(unsealed(stored.value())?).map_err(index_error),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn write_totals(txn: &WriteTransaction, totals: &[u64]) -> Result<(), JsError> {
+    let encoded = serde_json::to_vec(totals).map_err(index_error)?;
+    txn.open_table(META)
+        .map_err(index_error)?
+        .insert(TOTALS, crate::kv::seal(&encoded).as_slice())
+        .map_err(index_error)?;
+    Ok(())
+}
+
+/// Insert `rows` (whole documents, each document's rows in emit order) into
+/// `ROWS` and the key-ordered table, counting each shard's rows in `totals`.
+/// `on_row` sees each row's `ViewKey`.
+fn insert_rows(
+    txn: &WriteTransaction,
+    tables: &mut crate::view_store::Tables<'_>,
+    rows: &[Row],
+    placement: Placement,
+    mut on_row: impl FnMut(&crate::view_store::Tables<'_>, &[u8]) -> Result<(), JsError>,
+) -> Result<(), JsError> {
+    let mut table = txn.open_table(ROWS).map_err(index_error)?;
+    let mut ordinals: HashMap<&str, u32> = HashMap::new();
+    for row in rows {
+        let ordinal = ordinals.entry(row.id.as_str()).or_default();
+        let key = crate::view_store::row_key(
+            u32::try_from(placement.shard_of(&row.id)).map_err(index_error)?,
+            &placement.partition_of(&row.id),
+            &row.key,
+            &row.id,
+            *ordinal,
+        )?;
+        tables
+            .by_key
+            .insert(key.as_slice(), encode_value(&row.value)?.as_slice())
+            .map_err(index_error)?;
+        table
+            .insert(
+                (row.id.as_str(), *ordinal),
+                crate::kv::seal(&key).as_slice(),
+            )
+            .map_err(index_error)?;
+        on_row(tables, &key)?;
+        *ordinal += 1;
+    }
+    Ok(())
 }
 
 /// Create a view file's tables, empty.
 fn init_tables(db: &Database) -> Result<(), JsError> {
     let txn = crate::kv::begin_write(db).map_err(index_error)?;
     txn.open_table(ROWS).map_err(index_error)?;
+    txn.open_table(crate::view_store::BY_KEY)
+        .map_err(index_error)?;
+    txn.open_table(crate::view_store::BLOCKS)
+        .map_err(index_error)?;
+    txn.open_table(crate::view_store::PARTIALS)
+        .map_err(index_error)?;
     txn.open_table(META).map_err(index_error)?;
     txn.open_table(CURSOR).map_err(index_error)?;
     txn.commit().map_err(index_error)
@@ -1832,27 +1894,38 @@ impl ViewIndex {
                 txn.commit().map_err(index_error)
             });
         if outcome.is_err() {
-            drop(self.db.take());
-            self.cursor = IndexCursor::default();
-            self.design.clear();
-            self.cached = None;
-            // A reopen that fails is retried on the next use.
-            let _ = self.db();
+            self.close_after_failed_write();
         }
         outcome
     }
 
+    /// After a failed write, close the file and reopen it: redb may refuse
+    /// writes after a failed commit, and whether the commit reached the disk
+    /// is only known from the file.
+    fn close_after_failed_write(&mut self) {
+        drop(self.db.take());
+        self.cursor = IndexCursor::default();
+        self.design.clear();
+        self.cached = None;
+        // A reopen that fails is retried on the next use.
+        let _ = self.db();
+    }
+
+    /// Every row, in key order within each shard (and partition): the
+    /// key-ordered table read through.
     fn load_rows(&mut self) -> Result<Vec<Row>, JsError> {
         let txn = self.db()?.begin_read().map_err(index_error)?;
-        let table = txn.open_table(ROWS).map_err(index_error)?;
+        let table = txn
+            .open_table(crate::view_store::BY_KEY)
+            .map_err(index_error)?;
         let mut rows = Vec::new();
         for entry in table.iter().map_err(index_error)? {
             let (key, stored) = entry.map_err(index_error)?;
-            let stored = decode_row(stored.value())?;
+            let key = crate::view_store::read_row_key(key.value())?;
             rows.push(Row {
-                id: key.value().0.to_string(),
-                key: stored.key,
-                value: stored.value,
+                id: key.id.to_string(),
+                key: key.key,
+                value: decode_value(stored.value())?,
             });
         }
         Ok(rows)
@@ -1891,28 +1964,46 @@ impl ViewIndex {
         let track = self.cached.is_some();
         let mut removed = Vec::new();
         let mut added = Vec::new();
+        let placement = self.placement;
         self.commit(|txn| {
+            let mut tables = crate::view_store::Tables::open(txn)?;
+            let mut edits = crate::view_store::BlockEdits::default();
+            // Old rows go before new ones are added: a new row may collate
+            // equal to an old one under the same (id, ordinal).
             let mut table = txn.open_table(ROWS).map_err(index_error)?;
             for id in &changed {
                 let rows = (id.as_str(), 0)..=(id.as_str(), u32::MAX);
-                if track {
-                    for entry in table.range(rows.clone()).map_err(index_error)? {
-                        let (_, stored) = entry.map_err(index_error)?;
-                        removed.push((id.clone(), decode_row(stored.value())?.key));
+                for entry in table.range(rows.clone()).map_err(index_error)? {
+                    let (_, stored) = entry.map_err(index_error)?;
+                    let key = unsealed(stored.value())?;
+                    if track {
+                        let read = crate::view_store::read_row_key(key)?;
+                        removed.push((id.clone(), read.key));
                     }
+                    tables.by_key.remove(key).map_err(index_error)?;
+                    edits.count(&tables, key, -1)?;
                 }
                 table.retain_in(rows, |_, _| false).map_err(index_error)?;
             }
-            for (id, rows) in &by_doc {
-                for (ordinal, row) in rows.iter().enumerate() {
-                    let ordinal = u32::try_from(ordinal).map_err(index_error)?;
-                    table
-                        .insert((id.as_str(), ordinal), encode_row(row)?.as_slice())
-                        .map_err(index_error)?;
-                    added.push(row.clone());
-                }
-            }
             drop(table);
+            for rows in by_doc.values() {
+                insert_rows(txn, &mut tables, rows, placement, |tables, key| {
+                    edits.count(tables, key, 1)
+                })?;
+                added.extend(rows.iter().cloned());
+            }
+            let mut totals = read_totals(txn)?;
+            for (&shard, &change) in &edits.totals {
+                let total = totals
+                    .get_mut(shard as usize)
+                    .ok_or_else(|| JsError::Index("view index: no total for a shard".into()))?;
+                *total = total.checked_add_signed(change).ok_or_else(|| {
+                    JsError::Index("view index: a shard total went negative".into())
+                })?;
+            }
+            edits.finish(&mut tables)?;
+            drop(tables);
+            write_totals(txn, &totals)?;
             write_state(txn, &cursor, design)
         })?;
 
@@ -1930,34 +2021,111 @@ impl ViewIndex {
         Ok(())
     }
 
-    /// Replace every stored row with `rows`, recording `cursor` and
-    /// `design`, in one transaction: a rebuild that stops part-way leaves the
-    /// index as it was.
-    fn rebuild(
+    /// Start replacing every stored row. The rows go in a page at a time
+    /// (`Rebuild::add`) and become visible all at once (`finish_rebuild`); a
+    /// rebuild dropped part-way leaves the index as it was.
+    fn start_rebuild(&mut self) -> Result<Rebuild, JsError> {
+        let txn = crate::kv::begin_write(self.db()?).map_err(index_error)?;
+        for table in [
+            crate::view_store::BY_KEY,
+            crate::view_store::BLOCKS,
+            crate::view_store::PARTIALS,
+        ] {
+            txn.delete_table(table).map_err(index_error)?;
+        }
+        txn.delete_table(ROWS).map_err(index_error)?;
+        Ok(Rebuild {
+            txn,
+            placement: self.placement,
+            totals: vec![0; self.placement.q.max(1) as usize],
+        })
+    }
+
+    /// Make a rebuild's rows visible, recording `cursor` and `design`.
+    fn finish_rebuild(
         &mut self,
-        mut rows: Vec<Row>,
+        rebuild: Rebuild,
         cursor: IndexCursor,
         design: &str,
     ) -> Result<(), JsError> {
-        sort_rows(&mut rows);
-        self.commit(|txn| {
-            txn.delete_table(ROWS).map_err(index_error)?;
-            let mut table = txn.open_table(ROWS).map_err(index_error)?;
-            // A document's rows are numbered in the order they are stored.
-            let mut ordinals: HashMap<&str, u32> = HashMap::new();
-            for row in &rows {
-                let ordinal = ordinals.entry(row.id.as_str()).or_default();
-                table
-                    .insert((row.id.as_str(), *ordinal), encode_row(row)?.as_slice())
-                    .map_err(index_error)?;
-                *ordinal += 1;
-            }
-            drop(table);
-            write_state(txn, &cursor, design)
-        })?;
+        let Rebuild { txn, totals, .. } = rebuild;
+        let outcome = (|| {
+            let mut tables = crate::view_store::Tables::open(&txn)?;
+            crate::view_store::write_blocks(&mut tables, &totals)?;
+            drop(tables);
+            write_totals(&txn, &totals)?;
+            write_state(&txn, &cursor, design)?;
+            txn.commit().map_err(index_error)
+        })();
+        if let Err(error) = outcome {
+            self.close_after_failed_write();
+            return Err(error);
+        }
         self.cursor = cursor;
         self.design = design.to_string();
-        self.cached = Some(Arc::new(ViewRows::from_rows(rows, self.placement)));
+        self.cached = None;
+        Ok(())
+    }
+
+    /// Check that the key-ordered tables agree with `ROWS`, their block counts
+    /// add up and stay in range, and the shard totals hold.
+    #[cfg(test)]
+    fn check_tables(&mut self) -> Result<(), String> {
+        let txn = crate::kv::begin_write(self.db().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<Vec<u8>> = {
+            let table = txn.open_table(ROWS).map_err(|e| e.to_string())?;
+            let rows = table
+                .iter()
+                .map_err(|e| e.to_string())?
+                .map(|entry| {
+                    let (_, stored) = entry.map_err(|e| e.to_string())?;
+                    unsealed(stored.value())
+                        .map(<[u8]>::to_vec)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<Result<_, String>>()?;
+            rows
+        };
+        let totals = read_totals(&txn).map_err(|e| e.to_string())?;
+        let tables = crate::view_store::Tables::open(&txn).map_err(|e| e.to_string())?;
+        crate::view_store::check(&tables, &rows, &totals)
+    }
+
+    /// Replace every stored row with `rows` in one go.
+    #[cfg(test)]
+    fn rebuild(
+        &mut self,
+        rows: Vec<Row>,
+        cursor: IndexCursor,
+        design: &str,
+    ) -> Result<(), JsError> {
+        let mut rebuild = self.start_rebuild()?;
+        rebuild.add(&rows)?;
+        self.finish_rebuild(rebuild, cursor, design)
+    }
+}
+
+/// A rebuild in progress: its write transaction, held across the pages of
+/// documents it maps, and each shard's row count so far.
+struct Rebuild {
+    txn: WriteTransaction,
+    placement: Placement,
+    totals: Vec<u64>,
+}
+
+impl Rebuild {
+    /// Add the rows of whole documents, each document's rows in emit order.
+    fn add(&mut self, rows: &[Row]) -> Result<(), JsError> {
+        let mut tables = crate::view_store::Tables::open(&self.txn)?;
+        let totals = &mut self.totals;
+        let placement = self.placement;
+        insert_rows(&self.txn, &mut tables, rows, placement, |_, _| Ok(()))?;
+        for row in rows {
+            if let Some(total) = totals.get_mut(placement.shard_of(&row.id)) {
+                *total += 1;
+            }
+        }
         Ok(())
     }
 }
@@ -2252,16 +2420,27 @@ async fn ensure_rows(
             spec.reduce.as_deref().unwrap_or_default()
         )
     };
+    // The rows are stored in an order that depends on the key encoding, the
+    // collation data and how documents are placed: a change in any rebuilds.
+    let placement = Placement {
+        q: db.q,
+        partitioned: db.partitioned,
+        by_partition: db.partitioned && spec.partitioned,
+    };
+    let design = format!(
+        "{design}|keys={}|{}|q={}|partitioned={}|by_partition={}",
+        crate::collate::CODEC_VERSION,
+        crate::collate::ICU_DATA,
+        placement.q,
+        placement.partitioned,
+        placement.by_partition
+    );
     let gate = index_gate(db).read().await?;
     db.check_live()?;
     let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
     // A query queued behind a long build leaves when the database is deleted.
     let mut index = gate.until(handle.lock_owned()).await?;
-    index.set_placement(Placement {
-        q: db.q,
-        partitioned: db.partitioned,
-        by_partition: db.partitioned && spec.partitioned,
-    });
+    index.set_placement(placement);
     // Read after the lock: a query that updated the index while this one
     // waited has moved its cursor past any position read earlier, which
     // would look like a recreated database and force a full rebuild.
@@ -2357,9 +2536,11 @@ async fn ensure_rows(
         // Writes after them may be read too; the next update reads them
         // again, which only re-maps them. A purge after them leaves the
         // recorded purge sequence behind, so the next use rebuilds.
+        // Each page's rows are written into the rebuild's one transaction as
+        // they are mapped, so no list of every row is held.
         let bound = db.index_cursor();
         let mut cursor = crate::db::MapCursor::default();
-        let mut rows = Vec::new();
+        let mut rebuild: Option<Rebuild> = None;
         loop {
             let docs = db.map_docs_page(None, &mut cursor, CHANGES_PAGE).await?;
             if docs.is_empty() {
@@ -2367,19 +2548,28 @@ async fn ensure_rows(
             }
             let map = map.clone();
             // Between pages, so a deleted database is noticed.
-            (gate, index, rows) = blocking(move || {
+            (gate, index, rebuild) = blocking(move || {
                 gate.check()?;
-                rows.extend(run_map_json(&map, &docs, limits).map_err(|reason| {
+                let rows = run_map_json(&map, &docs, limits).map_err(|reason| {
                     ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-                })?);
-                Ok((gate, index, rows))
+                })?;
+                let mut rebuild = match rebuild {
+                    Some(rebuild) => rebuild,
+                    None => index.start_rebuild()?,
+                };
+                rebuild.add(&rows)?;
+                Ok((gate, index, Some(rebuild)))
             })
             .await?;
         }
         return blocking(move || {
             gate.check()?;
+            let rebuild = match rebuild {
+                Some(rebuild) => rebuild,
+                None => index.start_rebuild()?,
+            };
             index
-                .rebuild(rows, bound, &design)
+                .finish_rebuild(rebuild, bound, &design)
                 .and_then(|()| index.sorted_rows())
                 .map_err(ApiError::from)
         })
@@ -5188,6 +5378,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Random emits, rewrites and deletions keep the key-ordered tables in step
+    /// with the by-document rows, through block splits and merges, in several
+    /// shards and partitions; the rows read back are in collation order.
+    #[test]
+    fn key_ordered_tables_follow_random_writes() {
+        /// A small deterministic generator, so a failing sequence replays.
+        struct Lcg(u64);
+        impl Lcg {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) % bound
+            }
+        }
+        for (q, by_partition) in [(1, false), (3, false), (2, true)] {
+            let mut rng = Lcg(u64::from(q) + 7);
+            let mut index = index_over(redb::backends::InMemoryBackend::new());
+            index.set_placement(Placement {
+                q,
+                partitioned: by_partition,
+                by_partition,
+            });
+            let id = |n: u32| {
+                if by_partition {
+                    format!("p{}:d{n}", n % 3)
+                } else {
+                    format!("d{n}")
+                }
+            };
+            let emit = |rng: &mut Lcg, id: &str| -> Vec<Row> {
+                (0..rng.below(4))
+                    .map(|_| Row {
+                        id: id.to_string(),
+                        key: json!(rng.below(6)),
+                        value: json!(id),
+                    })
+                    .collect()
+            };
+            let mut start = Vec::new();
+            for n in 0..40 {
+                start.extend(emit(&mut rng, &id(n)));
+            }
+            index.rebuild(start, cursor_at(0), "map|").unwrap();
+            index.check_tables().unwrap();
+            for round in 1..60u64 {
+                let mut changed = Vec::new();
+                let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+                for _ in 0..1 + rng.below(11) {
+                    let doc = id(rng.below(60) as u32);
+                    if !changed.contains(&doc) {
+                        changed.push(doc.clone());
+                        let rows = emit(&mut rng, &doc);
+                        if !rows.is_empty() {
+                            by_doc.insert(doc, rows);
+                        }
+                    }
+                }
+                index
+                    .apply(changed, by_doc, cursor_at(round), "map|")
+                    .unwrap();
+                index
+                    .check_tables()
+                    .unwrap_or_else(|error| panic!("q={q} round {round}: {error}"));
+            }
+            // Read back in order: each run (shard, or partition) sorted by
+            // key, then id.
+            let rows = index.load_rows().unwrap();
+            let placement = index.placement;
+            for pair in rows.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let same_run = placement.shard_of(&a.id) == placement.shard_of(&b.id)
+                    && placement.partition_of(&a.id) == placement.partition_of(&b.id);
+                if same_run {
+                    assert_ne!(row_cmp(a, b), Ordering::Greater, "{a:?} {b:?}");
+                }
+            }
+        }
+    }
+
     /// An index over a fresh database on `backend`, as `create_file` makes one.
     fn index_over(backend: impl StorageBackend) -> ViewIndex {
         let db = crate::kv::open_with(backend, VIEW_CACHE_BYTES).unwrap();
@@ -5215,10 +5486,10 @@ mod tests {
         rows
     }
 
-    /// One update's rows, design and cursor are a single commit: whichever
-    /// sync the power is lost at, the reopened index holds the rows of the
-    /// cursor it records, never the rows of one update and the cursor of
-    /// another.
+    /// One update's rows, key-ordered rows, blocks, design and cursor are a
+    /// single commit: whichever sync the power is lost at, the reopened index
+    /// holds the rows of the cursor it records, with its tables in step, never
+    /// the rows of one update and the cursor of another.
     #[test]
     fn view_rows_and_cursor_commit_together() {
         let before = cursor_at(1);
@@ -5249,6 +5520,9 @@ mod tests {
                 ViewIndex::over(crate::kv::open_with(switch.backend(), VIEW_CACHE_BYTES).unwrap())
                     .unwrap();
             assert_eq!(index.design, "map|");
+            index
+                .check_tables()
+                .unwrap_or_else(|error| panic!("cut at sync {syncs}: {error}"));
             if index.cursor == before {
                 assert!(!finished, "an acknowledged update was lost");
                 assert_eq!(stored(&mut index), old, "cut at sync {syncs}");
@@ -5305,8 +5579,8 @@ mod tests {
             .unwrap();
         assert_eq!(result["total_rows"], 2, "{result}");
 
-        // Damage the value of a's row, and drop the warm rows so the next
-        // query reads the file.
+        // Damage the stored value of a's row, and drop the warm rows so the
+        // next query reads the file.
         let handle = index_handle(&index_path(&db, "_design/d", "v"))
             .await
             .unwrap();
@@ -5314,11 +5588,17 @@ mod tests {
             let mut index = handle.lock().await;
             let file = index.db.as_ref().unwrap();
             let txn = crate::kv::begin_write(file).unwrap();
-            let mut damaged = crate::kv::seal(br#"{"key":1,"value":null}"#);
+            // a's row's key, from its by-document entry.
+            let key = {
+                let rows = txn.open_table(ROWS).unwrap();
+                let stored = rows.get(("a", 0)).unwrap().unwrap();
+                unsealed(stored.value()).unwrap().to_vec()
+            };
+            let mut damaged = crate::kv::seal(b"null");
             damaged[0] ^= 0x20;
-            txn.open_table(ROWS)
+            txn.open_table(crate::view_store::BY_KEY)
                 .unwrap()
-                .insert(("a", 0), damaged.as_slice())
+                .insert(key.as_slice(), damaged.as_slice())
                 .unwrap();
             txn.commit().unwrap();
             index.cached = None;

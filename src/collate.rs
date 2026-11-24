@@ -1,5 +1,5 @@
-//! CouchDB view collation. The comparison walks any value that implements
-//! `Collate`, so a stored key form can share every rule with `Value`.
+//! CouchDB view collation, one implementation for JSON values and for the
+//! compact binary form view keys are stored in.
 //!
 //! The order is CouchDB's (`couch_ejson_compare`): null, false, true,
 //! numbers, strings (ICU), arrays (member by member, then length), objects
@@ -246,6 +246,210 @@ pub(crate) fn compare_strings(a: &str, b: &str) -> Ordering {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The encoded form
+
+/// Bumped whenever the encoding or the order changes; a view index written
+/// under another version is rebuilt.
+pub(crate) const CODEC_VERSION: u32 = 1;
+
+/// The ICU collation data strings are ordered by. A view index written under
+/// other data is rebuilt, so a dependency upgrade that changes string order
+/// cannot leave a stored index out of order. A test keeps this in step with
+/// Cargo.lock.
+pub(crate) const ICU_DATA: &str = "icu_collator_data 2.4.0";
+
+const TAG_NULL: u8 = 0;
+const TAG_FALSE: u8 = 1;
+const TAG_TRUE: u8 = 2;
+const TAG_NUMBER: u8 = 3;
+const TAG_STRING: u8 = 4;
+const TAG_ARRAY: u8 = 5;
+const TAG_OBJECT: u8 = 6;
+
+/// A view key in its stored form: a tag per value; numbers and strings as
+/// their text behind a length; arrays and objects as a member count followed
+/// by the members, object members as a name (length and text) and a value.
+/// Lengths and counts are LEB128. Appended to `out`.
+pub(crate) fn encode_into(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(TAG_NULL),
+        Value::Bool(false) => out.push(TAG_FALSE),
+        Value::Bool(true) => out.push(TAG_TRUE),
+        Value::Number(number) => {
+            out.push(TAG_NUMBER);
+            put_text(number.as_str(), out);
+        }
+        Value::String(text) => {
+            out.push(TAG_STRING);
+            put_text(text, out);
+        }
+        Value::Array(items) => {
+            out.push(TAG_ARRAY);
+            put_len(items.len(), out);
+            for item in items {
+                encode_into(item, out);
+            }
+        }
+        Value::Object(members) => {
+            out.push(TAG_OBJECT);
+            put_len(members.len(), out);
+            for (name, item) in members {
+                put_text(name, out);
+                encode_into(item, out);
+            }
+        }
+    }
+}
+
+fn put_len(mut len: usize, out: &mut Vec<u8>) {
+    loop {
+        let byte = (len & 0x7f) as u8;
+        len >>= 7;
+        if len == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn put_text(text: &str, out: &mut Vec<u8>) {
+    put_len(text.len(), out);
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// A length at the start of `bytes`, and the bytes after it.
+fn take_len(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    let mut len = 0usize;
+    for (at, byte) in bytes.iter().enumerate().take(10) {
+        len |= usize::from(byte & 0x7f).checked_shl(7 * at as u32)?;
+        if byte & 0x80 == 0 {
+            return Some((len, &bytes[at + 1..]));
+        }
+    }
+    None
+}
+
+/// Text behind a length at the start of `bytes`, and the bytes after it.
+fn take_text(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    let (len, rest) = take_len(bytes)?;
+    let text = std::str::from_utf8(rest.get(..len)?).ok()?;
+    Some((text, &rest[len..]))
+}
+
+/// The encoded value at the start of `bytes`, and the bytes after it.
+fn take_value(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&tag, body) = bytes.split_first()?;
+    let rest = match tag {
+        TAG_NULL | TAG_FALSE | TAG_TRUE => body,
+        TAG_NUMBER | TAG_STRING => take_text(body)?.1,
+        TAG_ARRAY | TAG_OBJECT => {
+            let (count, mut rest) = take_len(body)?;
+            for _ in 0..count {
+                if tag == TAG_OBJECT {
+                    rest = take_text(rest)?.1;
+                }
+                rest = take_value(rest)?.1;
+            }
+            rest
+        }
+        _ => return None,
+    };
+    Some((&bytes[..bytes.len() - rest.len()], rest))
+}
+
+/// The encoded value at the start of `bytes` and the bytes after it, or
+/// `None` when they do not start with a well-formed value.
+pub(crate) fn split_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    take_value(bytes)
+}
+
+/// The value of an encoded key split off by `split_key`, or `None` when a
+/// number in it does not parse.
+pub(crate) fn decode(key: &[u8]) -> Option<Value> {
+    to_value(Encoded(key))
+}
+
+fn to_value(encoded: Encoded<'_>) -> Option<Value> {
+    Some(match encoded.node() {
+        Node::Null => Value::Null,
+        Node::False => Value::Bool(false),
+        Node::True => Value::Bool(true),
+        Node::Number(text) => Value::Number(text.parse().ok()?),
+        Node::String(text) => Value::String(text.to_string()),
+        Node::Array(members) => Value::Array(
+            members
+                .map(|(_, member)| to_value(member))
+                .collect::<Option<_>>()?,
+        ),
+        Node::Object(members) => Value::Object(
+            members
+                .map(|(name, member)| Some((name.to_string(), to_value(member)?)))
+                .collect::<Option<_>>()?,
+        ),
+    })
+}
+
+/// Compare two encoded keys split off by `split_key`, in CouchDB order.
+pub(crate) fn cmp_split(a: &[u8], b: &[u8]) -> Ordering {
+    cmp(Encoded(a), Encoded(b))
+}
+
+/// One well-formed encoded value.
+#[derive(Clone, Copy)]
+struct Encoded<'a>(&'a [u8]);
+
+/// The members of an encoded array or object.
+struct EncodedMembers<'a> {
+    rest: &'a [u8],
+    left: usize,
+    named: bool,
+}
+
+impl<'a> Iterator for EncodedMembers<'a> {
+    type Item = (&'a str, Encoded<'a>);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let mut name = "";
+        if self.named {
+            let (text, rest) = take_text(self.rest)?;
+            name = text;
+            self.rest = rest;
+        }
+        let (value, rest) = take_value(self.rest)?;
+        self.rest = rest;
+        Some((name, Encoded(value)))
+    }
+}
+
+impl<'a> Collate<'a> for Encoded<'a> {
+    type Members = EncodedMembers<'a>;
+    /// Only called on well-formed values: anything else reads as null.
+    fn node(self) -> Node<'a, EncodedMembers<'a>> {
+        let Some((&tag, body)) = self.0.split_first() else {
+            return Node::Null;
+        };
+        let text = || take_text(body).map_or("", |(text, _)| text);
+        let members = |named| {
+            let (left, rest) = take_len(body).unwrap_or((0, &[]));
+            EncodedMembers { rest, left, named }
+        };
+        match tag {
+            TAG_FALSE => Node::False,
+            TAG_TRUE => Node::True,
+            TAG_NUMBER => Node::Number(text()),
+            TAG_STRING => Node::String(text()),
+            TAG_ARRAY => Node::Array(members(false)),
+            TAG_OBJECT => Node::Object(members(true)),
+            _ => Node::Null,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +458,38 @@ mod tests {
 
     fn number(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    fn encode(value: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_into(value, &mut out);
+        out
+    }
+
+    /// Compare two whole encoded keys.
+    fn cmp_encoded(a: &[u8], b: &[u8]) -> Ordering {
+        let (Some((a, [])), Some((b, []))) = (split_key(a), split_key(b)) else {
+            panic!("not one encoded key");
+        };
+        cmp_split(a, b)
+    }
+
+    /// `ICU_DATA` names the collation data the build uses: an upgrade must
+    /// bump it, so stored view indexes are rebuilt.
+    #[test]
+    fn icu_data_matches_the_lock_file() {
+        let lock = include_str!("../Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"icu_collator_data\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = "))
+            })
+            .map(|version| version.trim_matches('"'))
+            .expect("icu_collator_data in Cargo.lock");
+        assert_eq!(ICU_DATA, format!("icu_collator_data {version}"));
     }
 
     #[test]
@@ -290,6 +526,33 @@ mod tests {
         assert!(!has_out_of_range_number(&number(
             "123456789012345678901234567890"
         )));
+    }
+
+    #[test]
+    fn encoded_keys_round_trip_and_order_like_values() {
+        let keys = [
+            json!(null),
+            json!(false),
+            json!(true),
+            number("-1.5"),
+            number("1"),
+            number("1.0"),
+            number("9007199254740993"),
+            json!("a"),
+            json!("B"),
+            json!("é"),
+            json!([]),
+            json!([1, "x", [null]]),
+            json!({"a": 1, "b": [true]}),
+            json!({}),
+        ];
+        for a in &keys {
+            let encoded = encode(a);
+            assert_eq!(decode(&encoded).as_ref(), Some(a));
+            for b in &keys {
+                assert_eq!(cmp_encoded(&encoded, &encode(b)), cmp_json(a, b), "{a} {b}");
+            }
+        }
     }
 
     /// JSON keys, numbers drawn to collide as `f64` and to exceed it.
@@ -354,5 +617,11 @@ mod tests {
             }
         }
 
+        #[test]
+        fn encoded_keys_agree_with_values(a in key(), b in key()) {
+            let (ea, eb) = (encode(&a), encode(&b));
+            prop_assert_eq!(decode(&ea), Some(a.clone()));
+            prop_assert_eq!(cmp_encoded(&ea, &eb), cmp_json(&a, &b));
+        }
     }
 }
