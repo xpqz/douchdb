@@ -15248,6 +15248,55 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
     }
 }
 
+/// Every sandbox hands back the number text QuickJS produced: large integers
+/// and long decimals from map and reduce functions read the same whichever
+/// mode ran them.
+#[tokio::test]
+async fn sandboxes_agree_on_emitted_number_text() {
+    let mut seen: Option<(String, String)> = None;
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsnumbers{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/doc"), json!({"v": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/v"),
+                json!({"views": {
+                    "n": {"map": "function(doc){ emit(doc._id, [12345678901234567000, 1e21, 0.1 + 0.2, -9007199254740993, 123.456e-300]); }"},
+                    "r": {"map": "function(doc){ emit(doc._id, 1); }",
+                          "reduce": "function(k, v){ return [12345678901234567000, 1e21, 0.1 + 0.2, -9007199254740993, 123.456e-300]; }"}
+                }}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut value = String::new();
+        for view in ["n", "r"] {
+            let url = format!("{}/{db}/_design/v/_view/{view}", s.base);
+            let text = s
+                .client
+                .get(&url)
+                .send()
+                .await
+                .expect("view")
+                .text()
+                .await
+                .expect("view body");
+            let start = text.find("\"value\":").expect("a value") + 8;
+            value.push_str(&text[start..text[start..].find(']').unwrap() + start + 1]);
+        }
+        match &seen {
+            None => seen = Some((mode.to_string(), value)),
+            Some((first, expected)) => assert_eq!(&value, expected, "{mode} vs {first}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
     // CouchDB takes the row id from the stored document, not from the object
