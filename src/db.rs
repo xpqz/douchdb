@@ -4745,10 +4745,10 @@ pub(crate) enum ChangesItem {
 #[derive(Debug, Default)]
 pub struct RevsDiff(pub Vec<(String, RevsDiffEntry)>);
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RevsDiffEntry {
     pub missing: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub possible_ancestors: Vec<String>,
 }
 
