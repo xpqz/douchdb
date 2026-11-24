@@ -7640,6 +7640,123 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows[0]["deleted"], true);
 }
 
+/// A clustered feed reads the nodes a page at a time (1000 rows a node), so
+/// a coordinator never holds a whole shard's changes. Every row still arrives
+/// once, `limit` and `pending` still hold across pages, and a continuous feed
+/// reads on through the pages without waiting for a commit.
+#[tokio::test]
+async fn cluster_changes_page_through_large_shards() {
+    // One shard on one node, then four spread over the three nodes, each
+    // node's lane more than a page.
+    for (q, total) in [(1, 2500), (4, 4000)] {
+        cluster_changes_pages(q, total).await;
+    }
+}
+
+async fn cluster_changes_pages(q: u32, total: usize) {
+    let nodes = start_cluster_sharded(3, q, 1);
+    for node in &nodes {
+        node.fresh_db("clpages").await;
+    }
+    let docs: Vec<Value> = (0..total)
+        .map(|i| json!({"_id": format!("d{i:05}")}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/clpages/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ids = |rows: &[Value]| -> std::collections::BTreeSet<String> {
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Two of the three nodes hold no copy and take the cluster path.
+    for node in &nodes {
+        let (status, all) = node.get("/clpages/_changes").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = all["results"].as_array().unwrap();
+        assert_eq!(rows.len(), total, "{}", node.base);
+        assert_eq!(ids(rows).len(), total, "{}", node.base);
+        assert_eq!(all["pending"], 0);
+        let (_, after) = node
+            .get(&format!(
+                "/clpages/_changes?since={}",
+                all["last_seq"].as_str().unwrap()
+            ))
+            .await;
+        assert_eq!(after["results"], json!([]), "{after}");
+
+        let (_, part) = node.get("/clpages/_changes?limit=1500").await;
+        let first = part["results"].as_array().unwrap();
+        assert_eq!(first.len(), 1500);
+        assert_eq!(part["pending"], total - 1500, "{}", node.base);
+        let (_, rest) = node
+            .get(&format!(
+                "/clpages/_changes?since={}",
+                part["last_seq"].as_str().unwrap()
+            ))
+            .await;
+        let rest = rest["results"].as_array().unwrap();
+        let mut seen = ids(first);
+        seen.extend(ids(rest));
+        assert_eq!(first.len() + rest.len(), total);
+        assert_eq!(seen.len(), total);
+
+        let text = node
+            .client
+            .get(format!(
+                "{}/clpages/_changes?feed=continuous&since=0&timeout=1",
+                node.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let rows: Vec<Value> = lines
+            .iter()
+            .filter(|line| line.get("id").is_some())
+            .cloned()
+            .collect();
+        assert_eq!(ids(&rows).len(), total, "{}", node.base);
+
+        // A longpoll with changes waiting answers with all of them.
+        let (status, long) = node
+            .get("/clpages/_changes?feed=longpoll&since=0&timeout=60000")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = long["results"].as_array().unwrap();
+        assert_eq!(rows.len(), total, "{}", node.base);
+        assert_eq!(ids(rows).len(), total, "{}", node.base);
+        assert_eq!(long["pending"], 0);
+        let text = node
+            .client
+            .get(format!(
+                "{}/clpages/_changes?feed=longpoll&since=0&timeout=60000&heartbeat=10000",
+                node.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let long: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(
+            ids(long["results"].as_array().unwrap()).len(),
+            total,
+            "{}",
+            node.base
+        );
+    }
+}
+
 // With `update_seq=true`, `_all_docs`, `_design_docs` and view queries report
 // the same opaque vector `GET /db` does, as CouchDB sends a sequence string
 // in all of them (fabric_view_all_docs.erl, fabric_view_map.erl,

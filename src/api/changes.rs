@@ -155,7 +155,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
 
 /// `feed=normal`: the raw fast path when it applies, else one pass.
 async fn changes_normal(
-    st: &AppState,
+    st: &Arc<AppState>,
     db: &Arc<Db>,
     req: DbRequest<'_>,
     opts: &FeedOpts,
@@ -171,8 +171,86 @@ async fn changes_normal(
         return response;
     }
     match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
-        Ok(v) => json_of(StatusCode::OK, &v),
+        Ok((page, false)) => json_of(StatusCode::OK, &page),
+        Ok((page, true)) => {
+            changes_normal_paged(st.clone(), db.clone(), dbname, q, body, headers, page)
+        }
         Err(e) => fail(e),
+    }
+}
+
+/// A clustered `feed=normal` read too large for one page: the first page is
+/// read already (so an error still gets its own status); the rest stream.
+fn changes_normal_paged(
+    st: Arc<AppState>,
+    db: Arc<Db>,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    first: ChangesList,
+) -> Response {
+    let stream = paged_changes_body(st, db, dbname, q, body, headers, first);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| fail(ApiError::internal("building the changes response")))
+}
+
+/// The JSON of a clustered changes read that did not fit one page: `first`'s
+/// rows, then each further page's, each read from where the previous one
+/// ended, until no node has more or the request's `limit` is reached; then
+/// the last page's `last_seq` and `pending`. A paged read is not one
+/// snapshot: a document written while it runs may be listed again, with its
+/// new sequence, as any later read would list it.
+fn paged_changes_body(
+    st: Arc<AppState>,
+    db: Arc<Db>,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    first: ChangesList,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let dbname = dbname.to_string();
+    let mut query = q.clone();
+    let limit = num(q, "limit");
+    let body = Bytes::copy_from_slice(body);
+    let headers = headers.clone();
+    async_stream::stream! {
+        let mut buffer = String::from("{\"results\":[");
+        let (mut page, mut more) = (first, true);
+        let mut sent = 0usize;
+        loop {
+            for row in &page.results {
+                if sent > 0 {
+                    buffer.push(',');
+                }
+                buffer.push_str(&serde_json::to_string(row).unwrap_or_default());
+                sent += 1;
+            }
+            let left = limit.map(|limit| limit.saturating_sub(sent));
+            if !more || left == Some(0) || page.results.is_empty() {
+                break;
+            }
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+            query.insert("since".to_string(), page.last_seq.clone());
+            if let Some(left) = left {
+                query.insert("limit".to_string(), left.to_string());
+            }
+            match changes_once(&st, &db, &dbname, &query, &body, &headers, false).await {
+                Ok(next) => (page, more) = next,
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!("{}: {}", error.error, error.reason)));
+                    return;
+                }
+            }
+        }
+        buffer.push_str("],\"last_seq\":");
+        buffer.push_str(&serde_json::to_string(&page.last_seq).unwrap_or_default());
+        buffer.push_str(&format!(",\"pending\":{}}}", page.pending));
+        yield Ok(Bytes::from(buffer));
     }
 }
 
@@ -215,9 +293,13 @@ fn changes_continuous(
                 break;
             }
             wake.borrow_and_update();
+            // Whether a node has rows past the page just read: then the feed
+            // reads on at once instead of waiting for a commit.
+            let mut more = false;
             if poll {
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                Ok(value) => {
+                Ok((value, rest)) => {
+                    more = rest;
                     if !still_allowed(&st, &db, &principal) {
                         trailer = None;
                         break;
@@ -254,7 +336,9 @@ fn changes_continuous(
                 }
             }
             }
-            if started.elapsed().as_millis() as u64 >= deadline
+            // The timeout ends an idle feed: the changes already there are
+            // all sent first, as one unpaged read would have sent them.
+            if (!more && started.elapsed().as_millis() as u64 >= deadline)
                 || limit.is_some_and(|limit| sent >= limit)
                 || st.shutdown.is_cancelled()
             {
@@ -267,7 +351,8 @@ fn changes_continuous(
                     b"\n"
                 }));
             }
-            poll = wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
+            poll = more
+                || wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
         }
         // CouchDB's eventsource feed ends without this line.
         if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
@@ -322,12 +407,22 @@ fn changes_longpoll_stream(
             wake.borrow_and_update();
             if poll {
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                Ok(value)
+                Ok((value, more))
                     if (!value.results.is_empty()
                         || started.elapsed().as_millis() as u64 >= deadline
                         || st.shutdown.is_cancelled())
                         && still_allowed(&st, &db, &principal) =>
                 {
+                    if more {
+                        let mut rest = Box::pin(paged_changes_body(
+                            st.clone(), db.clone(), &dbname, &query, &body, &headers, value,
+                        ));
+                        while let Some(chunk) = futures::StreamExt::next(&mut rest).await {
+                            yield chunk;
+                        }
+                        yield Ok(Bytes::from_static(b"\n"));
+                        break;
+                    }
                     let mut line = serde_json::to_vec(&value).unwrap_or_default();
                     line.push(b'\n');
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
@@ -335,7 +430,7 @@ fn changes_longpoll_stream(
                 }
                 // Read on from where this poll ended, so `since=now` is not
                 // resolved again past a write that wakes the feed.
-                Ok(value) => {
+                Ok((value, _)) => {
                     query.insert("since".to_string(), value.last_seq);
                 }
                 Err(error) => {
@@ -362,7 +457,7 @@ fn changes_longpoll_stream(
 /// `feed=longpoll` without a heartbeat: hold the request until a change
 /// arrives or the deadline passes, then answer once.
 async fn changes_longpoll(
-    st: &AppState,
+    st: &Arc<AppState>,
     db: &Arc<Db>,
     req: DbRequest<'_>,
     opts: &FeedOpts,
@@ -385,13 +480,24 @@ async fn changes_longpoll(
         }
         wake.borrow_and_update();
         match changes_once(st, db, dbname, &q, body, headers, opts.local_only).await {
-            Ok(v) if !v.results.is_empty() => {
+            Ok((v, more)) if !v.results.is_empty() => {
                 if !still_allowed(st, db, principal) {
                     return access_denied(principal);
                 }
+                if more {
+                    return changes_normal_paged(
+                        st.clone(),
+                        db.clone(),
+                        dbname,
+                        &q,
+                        body,
+                        headers,
+                        v,
+                    );
+                }
                 return json_of(StatusCode::OK, &v);
             }
-            Ok(v)
+            Ok((v, _))
                 if started.elapsed().as_millis() as u64 >= opts.deadline
                     || st.shutdown.is_cancelled() =>
             {
@@ -402,7 +508,7 @@ async fn changes_longpoll(
             }
             // Read on from where this poll ended, so `since=now` is not
             // resolved again past a write that wakes the feed.
-            Ok(v) => {
+            Ok((v, _)) => {
                 q.insert("since".to_string(), v.last_seq);
             }
             Err(e) => return fail(e),
@@ -629,7 +735,7 @@ async fn changes_once(
     body: &[u8],
     headers: &HeaderMap,
     local_only: bool,
-) -> DbResult<ChangesList> {
+) -> DbResult<(ChangesList, bool)> {
     st.feed_stats
         .changes_once
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -643,6 +749,7 @@ async fn changes_once(
             },
             q,
             body,
+            Some(CLUSTER_PAGE),
         )
         .await;
     }
@@ -655,8 +762,15 @@ async fn changes_once(
     // The sequences are opaque, as in CouchDB 3, where even one node is a
     // cluster. A peer's own reads get one shard per row token, which is all a
     // coordinator merging nodes needs.
-    db.changes(st.ctx.cluster.me, &opts, !local_only).await
+    Ok((
+        db.changes(st.ctx.cluster.me, &opts, !local_only).await?,
+        false,
+    ))
 }
+
+/// Rows a clustered read asks each node for at a time. A coordinator holds at
+/// most this many per node, and reads again for the rest.
+const CLUSTER_PAGE: usize = 1000;
 
 #[cfg(test)]
 mod tests {
