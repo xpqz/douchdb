@@ -212,7 +212,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
 /// opaque tokens, as in CouchDB 3: one position per shard range, on a named
 /// copy, the same form the changes feed returns, so they work as `since`. In
 /// a cluster they come from one fan-out to the nodes, which also gives the
-/// cluster-wide sizes.
+/// cluster-wide sizes and document counts.
 pub(crate) async fn public_tokens(
     st: &AppState,
     db: &Db,
@@ -231,6 +231,8 @@ pub(crate) async fn public_tokens(
     })
     .await?;
     info.set_sizes(tokens.sizes);
+    info.doc_count = tokens.doc_count;
+    info.doc_del_count = tokens.doc_del_count;
     Ok((tokens.update_seq, tokens.purge_seq))
 }
 

@@ -2889,19 +2889,21 @@ pub(crate) async fn fetch_node_changes(
 }
 
 /// One node's copy of a shard, as a coordinator's `GET /db` reads it:
-/// uuid, committed position, purge sequence and sizes.
-type LocalCopy = (String, u64, u64, crate::db::DbSizes);
+/// uuid, committed position, purge sequence, sizes and live and deleted
+/// document counts.
+type LocalCopy = (String, u64, u64, crate::db::DbSizes, (u64, u64));
 
-/// This node's copies of every shard, by shard index, from what each shard
-/// publishes: no round trip to the shard actors.
+/// This node's copies of every shard, by shard index.
 pub(crate) async fn local_copies(db: &Db) -> DbResult<Vec<LocalCopy>> {
     let purge_seqs = db.shard_purge_seqs().await?;
+    let counts = db.shard_counts().await?;
     Ok(db
         .shard_seqs()
         .into_iter()
         .zip(purge_seqs)
         .zip(db.published_shard_sizes())
-        .map(|(((uuid, seq), purged), sizes)| (uuid, seq, purged, sizes))
+        .zip(counts)
+        .map(|((((uuid, seq), purged), sizes), counts)| (uuid, seq, purged, sizes, counts))
         .collect())
 }
 
@@ -2942,6 +2944,9 @@ pub(crate) struct ClusterTokens {
     pub purge_seq: String,
     /// The chosen copies' sizes summed, as `fabric_db_info` sums them.
     pub sizes: crate::db::DbSizes,
+    /// The chosen copies' live and deleted documents, summed likewise.
+    pub doc_count: u64,
+    pub doc_del_count: u64,
 }
 
 /// The `update_seq` and `purge_seq` that `GET /db` reports in a cluster, and
@@ -2965,9 +2970,10 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<Cluste
     let mut seqs = Vec::with_capacity(db.q as usize);
     let mut purges = Vec::with_capacity(db.q as usize);
     let mut sizes = crate::db::DbSizes::default();
+    let (mut doc_count, mut doc_del_count) = (0u64, 0u64);
     for shard in 0..db.q as usize {
         let owner = preferred.iter().position(|mask| mask.covers(shard));
-        let (node, (uuid, seq, purged, copy_sizes)) = owner
+        let (node, (uuid, seq, purged, copy_sizes, (docs, deleted))) = owner
             .into_iter()
             .chain(map.replicas_of(shard as u32).iter().copied())
             .find_map(|node| {
@@ -2976,6 +2982,8 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<Cluste
             })
             .ok_or_else(nodedown)?;
         sizes.add(copy_sizes);
+        doc_count = doc_count.saturating_add(docs);
+        doc_del_count = doc_del_count.saturating_add(deleted);
         seqs.push(CopyPos {
             node,
             shard,
@@ -2993,6 +3001,8 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<Cluste
         update_seq: crate::since::encode(&seqs),
         purge_seq: crate::since::encode(&purges),
         sizes,
+        doc_count,
+        doc_del_count,
     })
 }
 
