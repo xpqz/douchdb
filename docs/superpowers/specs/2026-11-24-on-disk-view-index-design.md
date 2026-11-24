@@ -516,9 +516,12 @@ Each step is its own PR, green on CI and Jepsen:
    update.
 3. Map queries from `BY_KEY`, streamed, with stream lifetime rules.
 4. Reduce from block partials, computed lazily and committed through
-   `kv::begin_cache_write`.
-5. Remove `ViewRows`, `BlockTree` and the snapshot. Shrink the page cache.
-   Measure.
+   `kv::begin_cache_write`. With map queries already on disk, this leaves
+   the in-memory snapshot without a caller, so this step also removes it,
+   `BlockTree` and the incremental snapshot upkeep. `ViewRows` stays only
+   in tests, as the reference selection the key-ordered table is checked
+   against.
+5. Shrink the page cache. Measure.
 6. #194: the cluster streaming merge.
 
 ## Open questions
