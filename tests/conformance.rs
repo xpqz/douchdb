@@ -223,11 +223,14 @@ impl Server {
     async fn req(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         let mut request = self
             .client
-            .request(method, format!("{}{}", self.base, path));
+            .request(method.clone(), format!("{}{}", self.base, path));
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.expect("request");
+        let response = request
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{method} {path}: {error:?}"));
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         let value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -21272,4 +21275,146 @@ async fn longpoll_since_now_reports_the_write_that_wakes_it() {
             "{ids:?} {written:?}"
         );
     }
+}
+
+/// A cluster coordinator streams a map view by merging its owners' streams;
+/// the reply is the one a single node gives for the same documents, across
+/// ranges, direction, paging that spans shards, documents and partitions.
+#[tokio::test]
+async fn cluster_map_views_stream_the_rows_a_single_node_returns() {
+    let nodes = start_cluster(3);
+    let single = Server::start(false);
+    let view = json!({
+        "_id": "_design/d",
+        "views": {"v": {"map": "function (doc) {\n  emit(doc.n, doc._id.length);\n  if (doc.n % 3 === 0) { emit([doc.n, 'x'], null); emit(doc.n, 'again'); }\n  emit(doc.s, null);\n}"}}
+    });
+    let docs: Vec<Value> = (0..60)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i % 7, "s": (["a", "B", "b", "é"][i % 4])}))
+        .collect();
+    let partitioned: Vec<Value> = (0..30)
+        .map(|i| json!({"_id": format!("p{}:d{i:02}", i % 2), "n": i % 5, "s": "x"}))
+        .collect();
+    for server in [&nodes[0], &single] {
+        server.fresh_db("clstream").await;
+        let (status, _) = server.put("/clstreamp?partitioned=true", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut all = docs.clone();
+        all.push(view.clone());
+        let (status, _) = server
+            .post("/clstream/_bulk_docs", json!({"docs": all}))
+            .await;
+        assert!(status.is_success(), "{status}");
+        let mut all = partitioned.clone();
+        all.push(view.clone());
+        let (status, _) = server
+            .post("/clstreamp/_bulk_docs", json!({"docs": all}))
+            .await;
+        assert!(status.is_success(), "{status}");
+    }
+    let queries = [
+        "/clstream/_design/d/_view/v",
+        "/clstream/_design/d/_view/v?descending=true",
+        "/clstream/_design/d/_view/v?skip=17&limit=23",
+        "/clstream/_design/d/_view/v?descending=true&skip=5&limit=40",
+        "/clstream/_design/d/_view/v?limit=0",
+        "/clstream/_design/d/_view/v?skip=1000",
+        "/clstream/_design/d/_view/v?startkey=2&endkey=5&inclusive_end=false",
+        "/clstream/_design/d/_view/v?startkey=5&endkey=2&descending=true&skip=3",
+        "/clstream/_design/d/_view/v?key=3&startkey_docid=d20&skip=1&limit=4",
+        "/clstream/_design/d/_view/v?startkey=%22b%22&include_docs=true&limit=12",
+        "/clstream/_design/d/_view/v?update_seq=false&startkey=%5B3%5D",
+        "/clstreamp/_partition/p1/_design/d/_view/v?skip=2&limit=9",
+        "/clstreamp/_partition/p0/_design/d/_view/v?descending=true&include_docs=true",
+    ];
+    for path in queries {
+        let (cluster_status, cluster_body) = nodes[0].get(path).await;
+        let (single_status, single_body) = single.get(path).await;
+        assert_eq!(cluster_status, StatusCode::OK, "{path}: {cluster_body}");
+        assert_eq!(cluster_status, single_status, "{path}");
+        assert_eq!(cluster_body, single_body, "{path}");
+    }
+}
+
+/// An owner streams its rows to the coordinator as they are read, so a
+/// small page reads little of a big view, and an owner that dies after its
+/// first rows have gone out cuts the reply short instead of leaving rows
+/// out of a well-formed one.
+#[tokio::test]
+async fn a_cluster_view_stream_reads_what_it_sends_and_ends_early_when_an_owner_dies() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    let (status, _) = nodes[0].put("/clstreambig", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Node 0 coordinates and holds nothing, so every row comes from node 1.
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/clstreambig", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = nodes[0]
+        .put(
+            "/clstreambig/_design/d",
+            // Small documents, big rows: the map makes each value 4 KB.
+            json!({"views": {"v": {"map": "function (doc) { emit(doc._id, Array(4097).join('x')); }"}}}),
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+    let rows = 8000u64;
+    for batch in 0..(rows / 2000) {
+        let docs: Vec<Value> = (0..2000)
+            .map(|i| json!({"_id": format!("r{:05}", batch * 2000 + i)}))
+            .collect();
+        let (status, _) = nodes[0]
+            .post("/clstreambig/_bulk_docs", json!({"docs": docs}))
+            .await;
+        assert!(status.is_success(), "{status}");
+    }
+    // Build the index on its owner, which on a loaded machine can take
+    // longer than a request's usual deadline, then measure a small page.
+    let patient = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .unwrap();
+    let built = patient
+        .get(format!(
+            "{}/clstreambig/_design/d/_view/v?limit=1",
+            nodes[1].base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(built.status(), StatusCode::OK);
+    let before = db_counter(&nodes[1], "clstreambig", "view_rows_visited").await;
+    let (status, body) = nodes[0]
+        .get("/clstreambig/_design/d/_view/v?limit=10")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 10);
+    assert_eq!(body["total_rows"], rows);
+    let visited = db_counter(&nodes[1], "clstreambig", "view_rows_visited").await - before;
+    assert!(
+        visited < rows / 2,
+        "a page of 10 read {visited} of {rows} rows"
+    );
+
+    let mut response = nodes[0]
+        .client
+        .get(format!("{}/clstreambig/_design/d/_view/v", nodes[0].base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.chunk().await.unwrap().unwrap().to_vec();
+    nodes[1].kill();
+    let cut = loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => body.extend_from_slice(&bytes),
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    let complete = serde_json::from_slice::<Value>(&body).is_ok();
+    assert!(
+        cut || !complete,
+        "a reply of {} bytes ended as well-formed JSON after its owner died",
+        body.len()
+    );
 }

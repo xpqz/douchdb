@@ -937,6 +937,7 @@ mod tests {
                 secret: "test-secret".to_string(),
             },
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             auth: None,
             health: Default::default(),
         };
@@ -992,6 +993,7 @@ mod tests {
                 secret: "test-secret".to_string(),
             },
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             auth: None,
             health: Default::default(),
         };

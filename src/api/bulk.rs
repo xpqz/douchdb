@@ -823,6 +823,54 @@ pub(super) fn stream_json_rows<T: serde::Serialize + Send + 'static>(
     Body::from_stream(stream)
 }
 
+/// A peer's streamed rows for a cluster coordinator, as newline-delimited
+/// JSON: a line with `head`, one line per row, and an end line, so the
+/// coordinator can tell a finished stream from one that was cut. The first
+/// row is read before the status is sent, so an error there still gets its
+/// status; a later one ends the body without the end line.
+pub(super) async fn stream_ndjson_response(
+    head: Value,
+    rows: impl futures::Stream<Item = DbResult<Value>> + Send + 'static,
+) -> Response {
+    let mut rows = Box::pin(rows);
+    let first_row = rows.next().await;
+    if let Some(Err(error)) = first_row {
+        return fail(error);
+    }
+    let rows = futures::stream::iter(first_row).chain(rows);
+    let stream = async_stream::stream! {
+        let mut rows = Box::pin(rows);
+        let mut buffer = head.to_string().into_bytes();
+        buffer.push(b'\n');
+        while let Some(item) = rows.next().await {
+            let encoded = item.and_then(|row| serde_json::to_vec(&row).map_err(ApiError::internal));
+            match encoded {
+                Ok(encoded) => {
+                    buffer.extend_from_slice(&encoded);
+                    buffer.push(b'\n');
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!(
+                        "{}: {}",
+                        error.error, error.reason
+                    )));
+                    return;
+                }
+            }
+            if buffer.len() >= STREAM_CHUNK {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        buffer.extend_from_slice(b"{\"end\":true}\n");
+        yield Ok(Bytes::from(buffer));
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// The end of a `{"rows":[...]}` body: the array, the `update_seq` taken
 /// before the rows were read when the request asked for one, and the object.
 pub(super) fn rows_tail(update_seq: Option<Value>) -> Vec<u8> {

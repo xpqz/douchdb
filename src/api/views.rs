@@ -477,9 +477,9 @@ async fn combinable_reducer(
 async fn run_view(
     req: DbRequest<'_>,
     view: IndexRef<'_>,
-    query: &mut crate::view::ViewQuery,
+    query: &crate::view::ViewQuery,
     reducer: Option<&str>,
-) -> DbResult<Value> {
+) -> DbResult<crate::view::ViewReply> {
     let DbRequest {
         st,
         db,
@@ -487,10 +487,6 @@ async fn run_view(
         headers,
         ..
     } = req;
-    let IndexRef {
-        ddoc,
-        name: view_name,
-    } = view;
     let read = ClusterRead {
         ctx: &st.ctx,
         db,
@@ -498,14 +494,15 @@ async fn run_view(
         headers,
     };
     if let Some(reducer) = reducer {
-        cluster_reduce(read, view, query, reducer).await
+        cluster_reduce(read, view, query, reducer)
+            .await
+            .map(crate::view::ViewReply::Reduced)
     } else if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
-        let merged = cluster_view_rows(read, view, query).await?;
-        query.total_rows_override = Some(merged.total_rows);
-        query.offset_override = Some(merged.offset);
-        crate::view::finish(&merged.spec, merged.rows, merged.docs, query).await
+        cluster_view(read, db.clone(), view, query).await
     } else {
-        crate::view::query(db, ddoc, view_name, query).await
+        crate::view::query(db, view.ddoc, view.name, query)
+            .await
+            .map(crate::view::ViewReply::Reduced)
     }
 }
 
@@ -549,12 +546,15 @@ pub(super) async fn view_request(
         None
     };
     let started = std::time::Instant::now();
-    let result = if !st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
+    // A coordinator streaming a cluster view asks its owners for their rows
+    // as a stream.
+    let peer_stream = st.ctx.cluster.is_internal(headers) && flag(req.q, "stream");
+    let result = if peer_stream
+        || (!st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers))
+    {
         crate::view::query_stream(db.clone(), view.ddoc, view.name, &query).await
     } else {
-        run_view(req, view, &mut query, combine_reduce.as_deref())
-            .await
-            .map(crate::view::ViewReply::Reduced)
+        run_view(req, view, &query, combine_reduce.as_deref()).await
     };
     if !st.ctx.cluster.is_internal(headers) {
         crate::metrics::record_engine(
@@ -573,6 +573,10 @@ pub(super) async fn view_request(
                 value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
+        }
+        Ok(crate::view::ViewReply::Rows(rows)) if peer_stream => {
+            let head = json!({"total_rows": rows.total_rows, "offset": rows.offset});
+            stream_ndjson_response(head, rows.rows).await
         }
         Ok(crate::view::ViewReply::Rows(rows)) => {
             let head = format!(
