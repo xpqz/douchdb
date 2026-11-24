@@ -8,6 +8,7 @@ pub(crate) mod cluster;
 pub(crate) mod cluster_http;
 pub(crate) mod cluster_ops;
 pub(crate) mod cluster_state;
+pub(crate) mod collate;
 pub(crate) mod db;
 pub(crate) mod dbname;
 pub(crate) mod discovery;
