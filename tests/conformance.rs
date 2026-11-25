@@ -21445,3 +21445,61 @@ async fn a_cluster_view_stream_reads_what_it_sends_and_ends_early_when_an_owner_
         body.len()
     );
 }
+
+/// A cluster coordinator streams `_all_docs` by merging its owners' streams;
+/// the reply is the one a single node gives for the same documents, across
+/// ranges, direction, paging that spans shards, documents and partitions.
+#[tokio::test]
+async fn cluster_all_docs_streams_the_rows_a_single_node_returns() {
+    let nodes = start_cluster(3);
+    let single = Server::start(false);
+    let docs: Vec<Value> = (0..2500)
+        .map(|i| json!({"_id": format!("d{i:04}"), "n": i}))
+        .collect();
+    let partitioned: Vec<Value> = (0..40)
+        .map(|i| json!({"_id": format!("p{}:d{i:02}", i % 2), "n": i}))
+        .collect();
+    for server in [&nodes[0], &single] {
+        server.fresh_db("clalldocs").await;
+        let (status, _) = server.put("/clalldocsp?partitioned=true", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = server
+            .post("/clalldocs/_bulk_docs", json!({"docs": docs}))
+            .await;
+        assert!(status.is_success(), "{status}");
+        let (status, _) = server
+            .post("/clalldocsp/_bulk_docs", json!({"docs": partitioned}))
+            .await;
+        assert!(status.is_success(), "{status}");
+        // A conflict, so `conflicts=true` has something to show.
+        let (status, _) = server
+            .post(
+                "/clalldocs/_bulk_docs",
+                json!({"new_edits": false, "docs": [{"_id": "d0007", "_rev": "1-ffff", "n": 0}]}),
+            )
+            .await;
+        assert!(status.is_success(), "{status}");
+    }
+    let queries = [
+        "/clalldocs/_all_docs",
+        "/clalldocs/_all_docs?descending=true",
+        "/clalldocs/_all_docs?skip=1234&limit=1100",
+        "/clalldocs/_all_docs?descending=true&skip=7&limit=40",
+        "/clalldocs/_all_docs?limit=0",
+        "/clalldocs/_all_docs?skip=9999",
+        "/clalldocs/_all_docs?startkey=%22d0100%22&endkey=%22d0200%22&inclusive_end=false",
+        "/clalldocs/_all_docs?startkey=%22d0200%22&endkey=%22d0100%22&descending=true&skip=3",
+        "/clalldocs/_all_docs?startkey=%22d0005%22&limit=5&include_docs=true&conflicts=true",
+        "/clalldocsp/_partition/p1/_all_docs?skip=2&limit=9",
+        "/clalldocsp/_partition/p0/_all_docs?descending=true&include_docs=true",
+    ];
+    for path in queries {
+        let (single_status, single_body) = single.get(path).await;
+        assert_eq!(single_status, StatusCode::OK, "{path}: {single_body}");
+        for node in &nodes {
+            let (cluster_status, cluster_body) = node.get(path).await;
+            assert_eq!(cluster_status, single_status, "{path}: {cluster_body}");
+            assert_eq!(cluster_body, single_body, "{path}");
+        }
+    }
+}

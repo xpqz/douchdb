@@ -32,7 +32,8 @@ outside review).
   per 64 rows. Measurements: docs/performance.md, "Views on disk".
 - **The cluster merge streams map queries** (step 6, #194; `keys` added
   under #198). Each owner streams its shards' rows, at most `skip + limit`
-  of them, as newline-delimited JSON on the internal path (`stream=true`):
+  of them, as newline-delimited JSON on the internal path (marked by an
+  `x-douchdb-stream` header):
   a line of counts, one line per row, and an end line, so a cut stream is
   told apart from a finished one. The coordinator merges them in query
   order and writes rows as they arrive. For `keys`, an owner gets the

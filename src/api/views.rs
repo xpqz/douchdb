@@ -489,7 +489,7 @@ pub(super) async fn view_request(
     let started = std::time::Instant::now();
     // A coordinator streaming a cluster view asks its owners for their rows
     // as a stream.
-    let peer_stream = st.ctx.cluster.is_internal(headers) && flag(req.q, "stream");
+    let peer_stream = st.ctx.cluster.wants_stream(headers);
     let result = if peer_stream
         || (!st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers))
     {
