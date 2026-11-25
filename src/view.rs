@@ -427,7 +427,7 @@ impl ViewRows {
             runs[run].push(row);
         }
         for (run, mut rows) in runs.into_iter().enumerate() {
-            sort_rows(&mut rows);
+            rows.sort_by(row_cmp);
             view.shards[run] = ShardRows::from_sorted(rows);
         }
         view
@@ -1378,10 +1378,6 @@ fn extreme_combine(partials: &[Value], last: bool) -> Result<Value, JsError> {
 }
 
 /// Rows are ordered by CouchDB key collation, then document id.
-pub fn sort_rows(rows: &mut [Row]) {
-    rows.sort_by(row_cmp);
-}
-
 fn row_cmp(a: &Row, b: &Row) -> Ordering {
     cmp_json(&a.key, &b.key).then_with(|| a.id.cmp(&b.id))
 }
@@ -2327,12 +2323,15 @@ const DOC_CHUNK: usize = 256;
 /// listing does not build its rows, documents and JSON in memory at once:
 /// the rows are read from the index file a chunk at a time, the shards
 /// merged as they are read. A `keys` query, bounded by its keys, selects
-/// its rows first.
+/// its rows first. With `key_positions`, each row of a `keys` query also
+/// carries `k`, the place of its key in the order the rows are listed, so a
+/// coordinator can merge several owners' rows in that order.
 pub async fn query_stream(
     db: Arc<Db>,
     ddoc_id: &str,
     view_name: &str,
     query: &ViewQuery,
+    key_positions: bool,
 ) -> DbResult<ViewReply> {
     let spec = load_spec(&db, ddoc_id, view_name).await?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
@@ -2352,19 +2351,26 @@ pub async fn query_stream(
     query.offset_override = Some(selection.offset);
     let (ordered, total_rows, before_start) = ordered_rows(&selection.rows, &query);
     let skip = query.skip.min(total_rows.saturating_sub(before_start));
-    let selected: Vec<Row> = ordered
-        .into_iter()
-        .filter(|row| in_range(row, &query))
+    // `ordered` lists each requested key's rows in turn: the place of a
+    // row's key follows from how many rows each key has.
+    let runs = key_runs(&selection.rows, &query);
+    let places = runs
+        .iter()
+        .enumerate()
+        .flat_map(|(place, len)| std::iter::repeat_n(place, *len));
+    let selected: Vec<(usize, Row)> = places
+        .zip(ordered)
+        .filter(|(_, row)| in_range(row, &query))
         .skip(skip)
         .take(query.limit)
-        .cloned()
+        .map(|(place, row)| (place, row.clone()))
         .collect();
     drop(selection);
     let include_docs = query.include_docs;
     let rows = async_stream::stream! {
         for chunk in selected.chunks(DOC_CHUNK) {
             let docs = if include_docs {
-                let ids: Vec<String> = chunk.iter().map(|row| row.id.clone()).collect();
+                let ids: Vec<String> = chunk.iter().map(|(_, row)| row.id.clone()).collect();
                 match docs_by_ids(&db, &ids).await {
                     Ok(docs) => docs,
                     Err(error) => {
@@ -2375,8 +2381,12 @@ pub async fn query_stream(
             } else {
                 HashMap::new()
             };
-            for row in chunk {
-                yield Ok(map_row_entry(row, &docs, include_docs));
+            for (place, row) in chunk {
+                let mut entry = map_row_entry(row, &docs, include_docs);
+                if key_positions {
+                    entry["k"] = json!(place);
+                }
+                yield Ok(entry);
             }
         }
     };
@@ -2712,6 +2722,13 @@ pub fn check_query(spec: &ViewSpec, query: &ViewQuery) -> DbResult<()> {
             400,
             "query_parse_error",
             "Multi-key fetches for reduce views must use `group=true`",
+        ));
+    }
+    if reduce && spec.reduce.is_none() {
+        return Err(ApiError::new(
+            400,
+            "query_parse_error",
+            "Reduce is invalid for map-only views",
         ));
     }
     Ok(())
@@ -3582,6 +3599,21 @@ fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize,
         ordered.retain(|row| cmp_json(&row.key, key) == Ordering::Equal);
     }
     (ordered, total_rows, before_start)
+}
+
+/// How many rows each requested key lists, in the order `ordered_rows`
+/// lists them: the requested keys, reversed when descending.
+fn key_runs(rows: &[Row], query: &ViewQuery) -> Vec<usize> {
+    let keys = query.keys.as_deref().unwrap_or_default();
+    let count = |key: &Value| {
+        let (first, end) = equal_range(rows, key);
+        end - first
+    };
+    if query.descending {
+        keys.iter().rev().map(count).collect()
+    } else {
+        keys.iter().map(count).collect()
+    }
 }
 
 fn selected_row_ids(rows: &[Row], query: &ViewQuery) -> Vec<String> {
@@ -4875,7 +4907,7 @@ mod tests {
                 value: json!(i),
             })
             .collect();
-        sort_rows(&mut rows);
+        rows.sort_by(row_cmp);
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
@@ -5021,7 +5053,7 @@ mod tests {
         let mut after = rows.clone();
         after.retain(|row| !changed.contains(&row.id));
         after.extend(added.clone());
-        sort_rows(&mut after);
+        after.sort_by(row_cmp);
         for reducer in reducers {
             let mut index = index_over(redb::backends::InMemoryBackend::new());
             index.set_placement(placement);
@@ -5695,7 +5727,7 @@ mod tests {
 
     /// The keys a streamed query returns, with its `total_rows` and `offset`.
     async fn streamed(db: &Arc<Db>, query: &ViewQuery) -> (Vec<Value>, usize, usize) {
-        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", query)
+        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", query, false)
             .await
             .unwrap()
         else {
@@ -5839,9 +5871,10 @@ mod tests {
         let (expected, ..) = streamed(&db, &all).await;
         assert_eq!(expected.len(), 900);
         let start = || async {
-            let ViewReply::Rows(rows) = query_stream(Arc::clone(&db), "_design/d", "v", &all)
-                .await
-                .unwrap()
+            let ViewReply::Rows(rows) =
+                query_stream(Arc::clone(&db), "_design/d", "v", &all, false)
+                    .await
+                    .unwrap()
             else {
                 panic!("a map query streams");
             };
@@ -5874,7 +5907,7 @@ mod tests {
 
         // Eviction pressure: another view opened past the cap of one.
         let (first, rows) = start().await;
-        let other = query_stream(Arc::clone(&db), "_design/d", "w", &all).await;
+        let other = query_stream(Arc::clone(&db), "_design/d", "w", &all, false).await;
         assert!(other.is_ok());
         let (now, ..) = streamed(&db, &all).await;
         assert_eq!(drain(first, rows).await, now);
@@ -5908,7 +5941,7 @@ mod tests {
             include_docs: true,
             ..Default::default()
         };
-        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", &query)
+        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", &query, false)
             .await
             .unwrap()
         else {
