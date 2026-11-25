@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline-first Explorer</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1f23; --muted: #6b6f78; --line: #e3e1dc;
+    --accent: #2f6fde; --accent-soft: #dce7fb; --fatal: #d4483b; --ok: #2e8b57; --warn: #b7791f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171b; --panel: #1d2026; --ink: #e8e9ec; --muted: #9aa0ab; --line: #2c3038;
+      --accent: #6c9cf0; --accent-soft: #24324b; --fatal: #ef6b5e; --ok: #59c08a; --warn: #e0a84a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub, .muted { color: var(--muted); font-size: 12px; }
+  form#signin { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-top: 10px; }
+  form#signin label { display: flex; flex-direction: column; color: var(--muted); font-size: 12px; }
+  input, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { padding: 16px 20px; }
+  .panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 1000px) { .panes { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  section h2 { font-size: 14px; margin: 0; }
+  .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .switch { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .status { font-size: 12px; color: var(--muted); margin: 4px 0 10px; }
+  .status [data-role=state] { color: var(--ink); }
+  .kpis { display: flex; gap: 10px; margin-bottom: 10px; }
+  .kpi { flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  .kpi b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .kpi span { color: var(--muted); font-size: 12px; }
+  .kpi.fatal b { color: var(--fatal); }
+  .bars { display: grid; grid-template-columns: max-content 1fr max-content; gap: 3px 8px; font-size: 12px; align-items: center; min-height: 20px; }
+  .bars i { display: block; height: 10px; background: var(--accent); border-radius: 2px; }
+  .bars b { font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+  .offline { opacity: .75; }
+  .offline .head h2::after { content: " · offline"; color: var(--warn); font-weight: 500; }
+  ol#log { list-style: none; margin: 0; padding: 0; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 220px; overflow: auto; }
+  ol#log li { padding: 2px 0; border-bottom: 1px solid var(--line); }
+  .err { color: var(--fatal); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Offline-first explorer · airline accidents 2006–2007</h1>
+  <div class="sub">The same data three ways: queried on the cluster, and copied into two PouchDB "devices" in this
+    browser that sync with different cluster nodes. The online switches are simulated: a device stops syncing, the
+    remote pane refuses to send requests. To try it for real, stop the douchdb nodes or use the browser's offline mode.</div>
+  <form id="signin">
+    <label>node 0 <input id="node0" value="http://127.0.0.1:5984" size="24"></label>
+    <label>node 2 <input id="node2" value="http://127.0.0.1:5986" size="24"></label>
+    <label>user <input id="user" value="admin" size="8"></label>
+    <label>password <input id="password" type="password" value="secret" size="8"></label>
+    <button type="submit" class="primary" id="connect">Connect</button>
+  </form>
+</header>
+<main>
+  <div class="panes" id="panes"></div>
+  <section>
+    <div class="head"><h2>Event log</h2></div>
+    <ol id="log"></ol>
+  </section>
+</main>
+<script src="vendor/pouchdb.min.js"></script>
+<script>
+"use strict";
+
+const DB = "offline_demo";
+const PANES = {
+  remote: { title: "Remote", note: "Every query is a request to the cluster, through node 0." },
+  a: { title: "Device A", note: "PouchDB in this browser (offline-a), syncing with node 0. Queries run locally." },
+  b: { title: "Device B", note: "PouchDB in this browser (offline-b), syncing with node 2. Queries run locally." },
+};
+const cfg = {};
+const devices = {};
+const refreshing = {};
+
+// ---- page structure -------------------------------------------------------
+
+function paneHtml(key) {
+  const p = PANES[key];
+  const device = key !== "remote";
+  return `<section data-pane="${key}">
+    <div class="head"><h2>${p.title}</h2>
+      <label class="switch"><input type="checkbox" data-role="online" checked> online</label></div>
+    <div class="status">state: <span data-role="state">signed out</span>${device
+      ? ` · unsynced changes: <span data-role="unsynced">0</span>` : ""}</div>
+    <div class="kpis">
+      <div class="kpi"><b data-role="events">–</b><span>events</span></div>
+      <div class="kpi fatal"><b data-role="fatal">–</b><span>fatalities</span></div>
+      <div class="kpi"><b data-role="ms">–</b><span>last query</span></div>
+    </div>
+    <div class="bars" data-role="phases"></div>
+    <p class="muted">${p.note} <button type="button" data-role="reload">Run query again</button></p>
+  </section>`;
+}
+document.getElementById("panes").innerHTML = Object.keys(PANES).map(paneHtml).join("");
+
+function el(pane, role) {
+  return document.querySelector(`section[data-pane="${pane}"] [data-role="${role}"]`);
+}
+function setState(pane, text) {
+  el(pane, "state").textContent = text;
+}
+function hhmmss(d = new Date()) {
+  return d.toTimeString().slice(0, 8);
+}
+function log(text) {
+  const list = document.getElementById("log");
+  const li = document.createElement("li");
+  li.textContent = `${hhmmss()} ${text}`;
+  list.prepend(li);
+  while (list.children.length > 200) list.lastChild.remove();
+}
+
+// ---- the cluster ----------------------------------------------------------
+
+function authHeader() {
+  return "Basic " + btoa(`${cfg.user}:${cfg.password}`);
+}
+/** A request to the cluster through node 0, whatever the remote pane's switch says. */
+function observerFetch(path, init = {}) {
+  const headers = { authorization: authHeader(), "content-type": "application/json", ...(init.headers || {}) };
+  return fetch(cfg.node0 + path, { ...init, headers });
+}
+/** The remote pane's requests: refused while its switch is off, as with no network. */
+function remoteFetch(path, init) {
+  if (!el("remote", "online").checked) return Promise.reject(new Error("offline"));
+  return observerFetch(path, init);
+}
+async function remoteJson(path, init) {
+  const r = await remoteFetch(path, init);
+  const body = await r.json();
+  if (!r.ok) throw Object.assign(new Error(`${r.status} ${body.reason || body.error}`), { status: r.status });
+  return body;
+}
+
+// ---- summaries ------------------------------------------------------------
+
+/** Events, fatalities and the flight-phase breakdown, from _design/offline. */
+async function summary(key) {
+  if (key === "remote") {
+    const view = (name, qs) => remoteJson(`/${DB}/_design/offline/_view/${name}?${qs}`);
+    const [total, phases] = await Promise.all([view("by_date", "reduce=true"), view("by_phase", "group=true")]);
+    return { stats: total.rows[0] && total.rows[0].value, phases: phases.rows };
+  }
+  const db = devices[key].db;
+  const [total, phases] = await Promise.all([
+    db.query("offline/by_date", { reduce: true }),
+    db.query("offline/by_phase", { group: true }),
+  ]);
+  return { stats: total.rows[0] && total.rows[0].value, phases: phases.rows };
+}
+
+function render(key, s, ms) {
+  el(key, "events").textContent = s.stats ? String(s.stats.count) : "0";
+  el(key, "fatal").textContent = s.stats ? String(Math.round(s.stats.sum)) : "0";
+  el(key, "ms").textContent = `${Math.round(ms)} ms`;
+  const rows = s.phases.slice().sort((x, y) => y.value.count - x.value.count).slice(0, 6);
+  const max = Math.max(1, ...rows.map((r) => r.value.count));
+  const bars = el(key, "phases");
+  bars.replaceChildren();
+  for (const r of rows) {
+    const name = document.createElement("span");
+    name.textContent = r.key;
+    const bar = document.createElement("i");
+    bar.style.width = `${(100 * r.value.count) / max}%`;
+    const n = document.createElement("b");
+    n.textContent = String(r.value.count);
+    bars.append(name, bar, n);
+  }
+}
+
+/** Runs the pane's summary queries; a second call while one runs queues one rerun. */
+async function refresh(key) {
+  if (refreshing[key]) {
+    refreshing[key] = "again";
+    return;
+  }
+  refreshing[key] = "busy";
+  try {
+    do {
+      refreshing[key] = "busy";
+      const d = devices[key];
+      if (key === "remote") setState(key, "querying…");
+      else if (!d.indexed) setState(key, "building index…");
+      const t0 = performance.now();
+      const s = await summary(key);
+      render(key, s, performance.now() - t0);
+      if (key === "remote") setState(key, "idle");
+      else if (!d.indexed) {
+        d.indexed = true;
+        setState(key, d.status);
+      }
+    } while (refreshing[key] === "again");
+  } catch (e) {
+    if (key === "remote" && e.message === "offline") {
+      setState(key, "offline");
+      log("Remote: request refused (offline)");
+    } else {
+      setState(key, `error: ${e.message}`);
+      log(`${PANES[key].title}: query failed: ${e.message}`);
+    }
+  } finally {
+    refreshing[key] = null;
+  }
+}
+
+const timers = {};
+function refreshSoon(key) {
+  clearTimeout(timers[key]);
+  timers[key] = setTimeout(() => refresh(key), 250);
+}
+
+// ---- devices --------------------------------------------------------------
+
+function setDevice(d, status) {
+  d.status = status;
+  // While the first local query builds the index, the pane keeps saying so.
+  if (!d.pulled || d.indexed) setState(d.key, status);
+}
+
+function makeDevice(key, node) {
+  const d = {
+    key, node, label: PANES[key].title, name: `offline-${key}`,
+    db: new PouchDB(`offline-${key}`),
+    remote: new PouchDB(`${node}/${DB}`, { auth: { username: cfg.user, password: cfg.password } }),
+    online: el(key, "online").checked, pulled: false, indexed: false, status: "",
+    pull: null, sync: null, gen: 0, unsynced: new Set(),
+  };
+  d.changes = d.db.changes({ since: "now", live: true }).on("change", () => {
+    if (d.pulled) refreshSoon(key);
+  });
+  return d;
+}
+
+/** Starts the step the device is at: the first pull, then a live two-way sync. */
+function goOnline(d) {
+  if (!d.online) return;
+  if (d.pulled) startSync(d);
+  else startPull(d);
+}
+
+async function startPull(d) {
+  const gen = d.gen;
+  setDevice(d, "pulling 0/?");
+  let total = "?";
+  try {
+    total = (await d.remote.info()).doc_count;
+  } catch (e) {
+    log(`${d.label}: cannot reach ${d.node}: ${e.message || e.status}`);
+  }
+  if (gen !== d.gen) return;
+  setDevice(d, `pulling 0/${total}`);
+  const rep = (d.pull = PouchDB.replicate(d.remote, d.db, { batch_size: 500 }));
+  rep.on("change", (info) => {
+    if (gen === d.gen) setDevice(d, `pulling ${info.docs_written}/${total}`);
+  });
+  try {
+    const info = await rep;
+    if (gen !== d.gen || info.status === "cancelled") return;
+    d.pull = null;
+    d.pulled = true;
+    log(`${d.label}: pulled ${info.docs_written} documents from ${d.node}`);
+    startSync(d);
+    refresh(d.key);
+  } catch (e) {
+    if (gen !== d.gen) return;
+    d.pull = null;
+    setDevice(d, `error: ${e.message || e.status}`);
+    log(`${d.label}: first pull failed: ${e.message || e.status}; retrying in 5 s`);
+    setTimeout(() => gen === d.gen && goOnline(d), 5000);
+  }
+}
+
+function startSync(d) {
+  const gen = d.gen;
+  setDevice(d, "active");
+  d.sync = d.db
+    .sync(d.remote, { live: true, retry: true, batch_size: 500 })
+    .on("change", (info) => {
+      if (gen !== d.gen) return;
+      const n = info.change.docs.length;
+      log(`${d.label}: ${info.direction === "push" ? "pushed" : "pulled"} ${n} document${n === 1 ? "" : "s"}`);
+      onSyncChange(d, info);
+    })
+    .on("active", () => gen === d.gen && setDevice(d, "active"))
+    .on("paused", (err) => {
+      if (gen !== d.gen) return;
+      if (err) {
+        setDevice(d, `error: ${err.message || err.status}`);
+        log(`${d.label}: sync paused, will retry: ${err.message || err.status}`);
+      } else setDevice(d, "idle");
+    })
+    .on("denied", (err) => log(`${d.label}: push denied: ${err.message || err}`))
+    .on("error", (err) => {
+      if (gen !== d.gen) return;
+      setDevice(d, `error: ${err.message || err.status}`);
+      log(`${d.label}: sync stopped: ${err.message || err.status}`);
+    });
+}
+
+/** Stops whatever the device is doing (pull or sync); its local copy keeps working. */
+function goOffline(d) {
+  d.gen++;
+  if (d.pull) d.pull.cancel();
+  if (d.sync) d.sync.cancel();
+  d.pull = d.sync = null;
+  setState(d.key, "offline");
+  d.status = "offline";
+}
+
+function onSyncChange(d, info) {
+  if (info.direction === "push") {
+    for (const doc of info.change.docs) d.unsynced.delete(`${doc._id}@${doc._rev}`);
+    showUnsynced(d);
+  }
+}
+
+function showUnsynced(d) {
+  el(d.key, "unsynced").textContent = String(d.unsynced.size);
+}
+
+// ---- wiring ---------------------------------------------------------------
+
+for (const key of Object.keys(PANES)) {
+  el(key, "online").addEventListener("change", (ev) => {
+    const on = ev.target.checked;
+    document.querySelector(`section[data-pane="${key}"]`).classList.toggle("offline", !on);
+    if (!cfg.node0) return;
+    if (key === "remote") {
+      setState(key, on ? "idle" : "offline");
+      log(`Remote: ${on ? "online" : "offline, requests are refused"}`);
+      if (on) refresh(key);
+      return;
+    }
+    const d = devices[key];
+    d.online = on;
+    log(`${d.label}: ${on ? "online, syncing again" : "offline, sync stopped"}`);
+    if (on) goOnline(d);
+    else goOffline(d);
+  });
+  el(key, "reload").addEventListener("click", () => {
+    if (!cfg.node0) return;
+    if (key === "remote" || devices[key].pulled) refresh(key);
+  });
+}
+
+function connect() {
+  for (const id of ["node0", "node2", "user", "password"]) cfg[id] = document.getElementById(id).value.trim();
+  cfg.node0 = cfg.node0.replace(/\/+$/, "");
+  cfg.node2 = cfg.node2.replace(/\/+$/, "");
+  for (const input of document.querySelectorAll("#signin input, #connect")) input.disabled = true;
+  log(`Connected as ${cfg.user}: remote and Device A use ${cfg.node0}, Device B uses ${cfg.node2}`);
+  devices.a = makeDevice("a", cfg.node0);
+  devices.b = makeDevice("b", cfg.node2);
+  if (el("remote", "online").checked) refresh("remote");
+  else setState("remote", "offline");
+  for (const key of ["a", "b"]) {
+    if (devices[key].online) goOnline(devices[key]);
+    else goOffline(devices[key]);
+  }
+}
+
+document.getElementById("signin").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  connect();
+});
+if (new URLSearchParams(location.search).has("connect")) connect();
+</script>
+</body>
+</html>

@@ -54,8 +54,63 @@ async function cluster(pathname) {
 
 const sel = (pane, role) => `section[data-pane="${pane}"] [data-role="${role}"]`;
 
-/** The page's checks, in order. Tasks 3 and 4 fill this in. */
-const CHECKS = [];
+/** Text of a pane's element, trimmed. */
+const text = (tab, pane, role) => tab.textContent(sel(pane, role)).then((t) => (t || "").trim());
+
+/** Waits until a pane's element reads exactly `want`. */
+function waitText(tab, pane, role, want) {
+  return tab.waitForFunction(
+    ([s, w]) => (document.querySelector(s)?.textContent || "").trim() === w,
+    [sel(pane, role), String(want)]
+  );
+}
+
+/**
+ * Before connecting: switch Device B off the moment it starts its first pull
+ * (a MutationObserver fires before any replication response can arrive).
+ */
+async function cutDeviceBDuringPull(tab) {
+  await tab.evaluate((s) => {
+    const obs = new MutationObserver(() => {
+      const state = document.querySelector(s.state);
+      if (state && state.textContent.startsWith("pulling")) {
+        obs.disconnect();
+        document.querySelector(s.online).click();
+        window.__cutDuringPull = true;
+      }
+    });
+    obs.observe(document.body, { subtree: true, childList: true, characterData: true });
+  }, { state: sel("b", "state"), online: sel("b", "online") });
+}
+
+const CHECKS = [
+  ["remote_totals", async ({ tab, cluster, state }) => {
+    state.count = (await cluster("/offline_demo")).doc_count - 1;
+    await waitText(tab, "remote", "events", state.count);
+    state.fatal = Number(await text(tab, "remote", "fatal"));
+    if (!(state.fatal > 0)) throw new Error(`remote fatal ${state.fatal}`);
+  }],
+  ["devices_converge", async ({ tab, state }) => {
+    await waitText(tab, "b", "state", "offline");
+    if (!(await tab.evaluate(() => window.__cutDuringPull))) throw new Error("B was not cut during its pull");
+    await tab.click(sel("b", "online"));
+    for (const d of ["a", "b"]) {
+      await waitText(tab, d, "events", state.count);
+      await waitText(tab, d, "fatal", state.fatal);
+    }
+  }],
+  ["remote_offline_fails", async ({ tab, state }) => {
+    await tab.click(sel("remote", "online"));
+    await tab.click(sel("remote", "reload"));
+    await waitText(tab, "remote", "state", "offline");
+    await tab.click(sel("a", "reload"));
+    await tab.click(sel("b", "reload"));
+    for (const d of ["a", "b"]) await waitText(tab, d, "events", state.count);
+    await tab.click(sel("remote", "online"));
+    await tab.click(sel("remote", "reload"));
+    await waitText(tab, "remote", "state", "idle");
+  }],
+];
 
 async function main() {
   const server = await startPage();
@@ -72,6 +127,7 @@ async function main() {
     await tab.fill("#node2", node2);
     await tab.fill("#user", user);
     await tab.fill("#password", pass);
+    await cutDeviceBDuringPull(tab);
     await tab.click("#connect");
     const ctx = { tab, sel, cluster, state: {} };
     for (const [name, run] of CHECKS) {
