@@ -2599,13 +2599,36 @@ fn peer_stream_cut() -> ApiError {
     ApiError::new(502, "bad_gateway", "a peer's stream ended early")
 }
 
+/// How long a peer stream may stay silent while it is being waited on.
+const PEER_STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The JSON values of a newline-delimited body, one per line, read as the
 /// body arrives.
 fn ndjson_lines(
     response: reqwest::Response,
 ) -> futures::stream::BoxStream<'static, DbResult<Value>> {
+    let chunks = futures::stream::unfold(Some(response), |response| async move {
+        let mut response = response?;
+        match response.chunk().await {
+            Ok(Some(bytes)) => Some((Ok(bytes), Some(response))),
+            Ok(None) => None,
+            Err(error) => Some((Err(error.to_string()), None)),
+        }
+    });
+    split_lines(chunks.boxed(), PEER_STREAM_IDLE)
+}
+
+/// The lines of a stream of chunks, as JSON values. A wait for the next
+/// chunk that lasts `idle` fails the stream. Only a wait counts: a reader
+/// that stops reading (a merge serving another stream, or a slow client)
+/// can take as long as it likes, and data that arrived meanwhile is read.
+/// (`reqwest`'s own read timeout runs while nobody reads, so it would fail
+/// such a stream once it is read again.)
+fn split_lines(
+    mut chunks: futures::stream::BoxStream<'static, Result<axum::body::Bytes, String>>,
+    idle: std::time::Duration,
+) -> futures::stream::BoxStream<'static, DbResult<Value>> {
     let lines = async_stream::stream! {
-        let mut response = response;
         let mut buffer: Vec<u8> = Vec::new();
         loop {
             while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -2618,11 +2641,15 @@ fn ndjson_lines(
                     }
                 }
             }
-            match response.chunk().await {
-                Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
+            match tokio::time::timeout(idle, chunks.next()).await {
+                Ok(Some(Ok(bytes))) => buffer.extend_from_slice(&bytes),
                 Ok(None) => return,
-                Err(error) => {
-                    yield Err(ApiError::new(502, "bad_gateway", error.to_string()));
+                Ok(Some(Err(error))) => {
+                    yield Err(ApiError::new(502, "bad_gateway", error));
+                    return;
+                }
+                Err(_) => {
+                    yield Err(ApiError::new(502, "bad_gateway", "a peer stream went silent"));
                     return;
                 }
             }
@@ -3698,6 +3725,30 @@ async fn fetch_search_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer stream's idle limit counts only waits for data: a line that
+    /// arrived while nobody read is read however late, and a stream with
+    /// nothing coming fails once the limit has passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_stream_times_out_only_while_it_is_waited_on() {
+        let idle = std::time::Duration::from_secs(60);
+        let (send, receive) = futures::channel::mpsc::unbounded();
+        let mut lines = split_lines(receive.boxed(), idle);
+        send.unbounded_send(Ok(axum::body::Bytes::from_static(b"{\"a\":1}\n")))
+            .unwrap();
+        assert_eq!(lines.next().await.unwrap().unwrap(), json!({"a": 1}));
+        // Nobody reads for twice the limit; the next line comes meanwhile.
+        tokio::time::advance(idle * 2).await;
+        send.unbounded_send(Ok(axum::body::Bytes::from_static(b"{\"b\":2}\n")))
+            .unwrap();
+        assert_eq!(lines.next().await.unwrap().unwrap(), json!({"b": 2}));
+        // Nothing more comes: the wait fails after the limit.
+        let started = tokio::time::Instant::now();
+        let error = lines.next().await.unwrap().unwrap_err();
+        assert_eq!(error.status, 502, "{}", error.reason);
+        assert!(started.elapsed() >= idle);
+        drop(send);
+    }
     use serde_json::json;
 
     fn listing(docs: &[Value]) -> DocList {

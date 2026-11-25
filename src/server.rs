@@ -187,6 +187,11 @@ fn build_state(
         cache_bytes: args.cache_mb << 20,
         local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
     };
+    let tls_peers = args
+        .nodes
+        .iter()
+        .chain(&args.seed_nodes)
+        .any(|node| node.starts_with("https://"));
     Ok(Arc::new(AppState {
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
@@ -214,13 +219,8 @@ fn build_state(
                 n: args.n,
                 secret: args.cluster_secret.clone(),
             },
-            client: crate::cluster_http::peer_client(
-                args.nodes
-                    .iter()
-                    .chain(&args.seed_nodes)
-                    .any(|node| node.starts_with("https://")),
-            )?,
-            stream_client: crate::cluster_http::peer_stream_client()?,
+            client: crate::cluster_http::peer_client(tls_peers)?,
+            stream_client: crate::cluster_http::peer_stream_client(tls_peers)?,
             auth,
             health: Default::default(),
         },

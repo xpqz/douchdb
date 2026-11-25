@@ -143,6 +143,61 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// The stream client reads over HTTP/2, so a reply dropped part way (a
+    /// merge that has its page) cancels only its own stream: the server stops
+    /// producing it, and the next request goes out on the same client.
+    #[tokio::test]
+    async fn a_dropped_peer_stream_is_cancelled_on_its_own() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Count(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
+        impl Drop for Count {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.notify_one();
+            }
+        }
+        let (dropped, notify) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let (count, wake) = (Arc::clone(&dropped), Arc::clone(&notify));
+        // A body that never ends; it counts when the server drops it.
+        let app = Router::new().route(
+            "/endless",
+            get(move || {
+                let guard = Count(Arc::clone(&count), Arc::clone(&wake));
+                async move {
+                    let body = futures::stream::unfold(guard, |guard| async move {
+                        tokio::task::yield_now().await;
+                        Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 16384])),
+                            guard,
+                        ))
+                    });
+                    axum::body::Body::from_stream(body)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(serve(listener, app, shutdown.clone()));
+        let client = crate::cluster_http::peer_stream_client(false).unwrap();
+        for round in 1..=5 {
+            let mut reply = client.get(format!("{base}/endless")).send().await.unwrap();
+            assert_eq!(reply.version(), reqwest::Version::HTTP_2);
+            assert!(!reply.chunk().await.unwrap().unwrap().is_empty());
+            drop(reply);
+            while dropped.load(Ordering::SeqCst) < round {
+                notify.notified().await;
+            }
+        }
+        shutdown.cancel();
+        drop(client);
+        task.await.unwrap();
+    }
+
     /// Large bodies and small requests share one HTTP/2 connection and all
     /// complete (the windows are big enough to pass 12 MiB streams).
     #[tokio::test]
