@@ -42,10 +42,14 @@ outside review).
   order. Owner shard sets are disjoint, so the merge needs no
   deduplication. An owner that fails before its counts are in fails over
   to a replica as before; one that fails after rows have gone out ends the
-  reply early, as in CouchDB. These streams use their own HTTP/1.1 peer
-  client with a 60 s idle limit and no overall deadline: a slow client
-  then holds back only its own TCP connection, never the shared HTTP/2
-  connection's flow-control window that other peer calls use. Every
+  reply early, as in CouchDB. These streams use their own HTTP/2 peer
+  client, with a 60 s idle limit and no overall deadline. A merge that
+  stops reading a stream (it has its page) cancels that stream alone and
+  the connection is reused; with HTTP/1.1 every such query had to open a
+  new connection. The client's connection is separate from the one other
+  peer calls use, and its window holds 64 streams' worth: a slow client
+  holds back its own stream, and other streams only after 64 such stalls.
+  Every
   reduce runs on the owners, which send one partial per group; a
   coordinator without the design document reads it from a replica.
 - **#195 is deferred.** The `inclusive_end=false` with `endkey_docid`
