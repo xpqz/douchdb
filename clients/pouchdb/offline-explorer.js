@@ -83,6 +83,49 @@ async function cutDeviceBDuringPull(tab) {
   }, { state: sel("b", "state"), online: sel("b", "online") });
 }
 
+
+/** Polls `fn` (an async predicate) until it is true; fails after WAIT_MS. */
+async function until(what, fn) {
+  const end = Date.now() + WAIT_MS;
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+const ID = "fixture-0000";
+
+/** Opens the fixture's deadliest record in a pane and saves it with `change` applied. */
+async function edit(tab, pane, change) {
+  await tab.click(`${sel(pane, "pick")} button[data-id="${ID}"]`);
+  await tab.waitForFunction((s) => document.querySelector(s).textContent.trim() !== "", sel(pane, "record-rev"));
+  if (change.fatalDelta) {
+    const now = Number(await tab.inputValue(sel(pane, "fatal-input")));
+    await tab.fill(sel(pane, "fatal-input"), String(now + change.fatalDelta));
+  }
+  if (change.note !== undefined) await tab.fill(sel(pane, "note-input"), change.note);
+  const before = await text(tab, pane, "record-rev");
+  await tab.click(sel(pane, "save"));
+  return before;
+}
+
+/** The device's copy of the record, read in the page: {rev, conflicts, note}. */
+const localCopy = (tab, device, rev) =>
+  tab.evaluate(async ([d, id, r]) => {
+    const doc = await devices[d].db.get(id, r ? { rev: r } : { conflicts: true });
+    return { rev: doc._rev, conflicts: doc._conflicts || [], note: doc.demo_note };
+  }, [device, ID, rev]);
+
+const conflictRow = (d) => `#conflicts [data-device="${d}"][data-conflict-id="${ID}"]`;
+const timelineSeen = (tab, copy) => tab.textContent(`#timeline [data-copy="${copy}"] [data-role="seen"]`).then((t) => t.trim());
+const timelineRev = (tab, copy) => tab.textContent(`#timeline [data-copy="${copy}"] [data-role="rev"]`).then((t) => t.trim());
+
+/** Turns a pane's online switch to `on` (no-op if it already is). */
+async function setOnline(tab, pane, on) {
+  if ((await tab.isChecked(sel(pane, "online"))) !== on) await tab.click(sel(pane, "online"));
+}
+
 const CHECKS = [
   ["remote_totals", async ({ tab, cluster, state }) => {
     state.count = (await cluster("/offline_demo")).doc_count - 1;
@@ -109,6 +152,94 @@ const CHECKS = [
     await tab.click(sel("remote", "online"));
     await tab.click(sel("remote", "reload"));
     await waitText(tab, "remote", "state", "idle");
+  }],
+  ["offline_edit_stays_local", async ({ tab, state }) => {
+    await setOnline(tab, "a", false);
+    await edit(tab, "a", { fatalDelta: 1 });
+    await waitText(tab, "a", "unsynced", 1);
+    await waitText(tab, "a", "fatal", state.fatal + 1);
+    state.rev = await text(tab, "a", "record-rev");
+    if (Number(await text(tab, "b", "fatal")) !== state.fatal) throw new Error("B moved while A was offline");
+    await tab.click(sel("remote", "reload"));
+    await waitText(tab, "remote", "state", "idle");
+    if (Number(await text(tab, "remote", "fatal")) !== state.fatal) throw new Error("remote moved while A was offline");
+  }],
+  ["edit_propagates", async ({ tab, state }) => {
+    await setOnline(tab, "a", true);
+    for (const copy of ["a", "cluster", "b"]) {
+      await until(`${copy} to hold ${state.rev}`, async () => (await timelineSeen(tab, copy)) !== "");
+    }
+    await waitText(tab, "b", "fatal", state.fatal + 1);
+    await waitText(tab, "a", "unsynced", 0);
+  }],
+  ["stale_remote_edit", async ({ tab, cluster }) => {
+    await tab.click(`${sel("remote", "pick")} button[data-id="${ID}"]`);
+    await tab.waitForFunction((s) => document.querySelector(s).textContent.trim() !== "", sel("remote", "record-rev"));
+    const opened = await text(tab, "remote", "record-rev");
+    await edit(tab, "a", { note: "edited on A" });
+    await until("A's edit to reach the cluster", async () =>
+      (await timelineRev(tab, "cluster")) === (await text(tab, "a", "record-rev")) &&
+      (await text(tab, "a", "record-rev")) !== opened);
+    await tab.fill(sel("remote", "note-input"), "stale remote edit");
+    await tab.click(sel("remote", "save"));
+    await waitText(tab, "remote", "state", "changed elsewhere, reloaded");
+    const current = (await cluster(`/offline_demo/${ID}`))._rev;
+    if ((await text(tab, "remote", "record-rev")) !== current) throw new Error("remote form not reloaded");
+  }],
+  ["conflict_same_winner", async ({ tab, state }) => {
+    await until("B to hold A's last edit", async () => (await timelineSeen(tab, "b")) !== "");
+    await setOnline(tab, "a", false);
+    await setOnline(tab, "b", false);
+    await edit(tab, "a", { note: "from A" });
+    await edit(tab, "b", { note: "from B" });
+    await setOnline(tab, "a", true);
+    await setOnline(tab, "b", true);
+    for (const d of ["a", "b"]) await tab.waitForSelector(conflictRow(d));
+    const row = async (d) => [
+      await tab.textContent(`${conflictRow(d)} [data-role="winner"]`),
+      await tab.textContent(`${conflictRow(d)} [data-role="others"]`),
+    ].map((t) => t.trim());
+    await until("both devices to agree on the conflict", async () => {
+      const [a, b] = [await row("a"), await row("b")];
+      return a[0] === b[0] && a[1] === b[1] && a[1] !== "";
+    });
+    state.other = (await row("a"))[1];
+  }],
+  ["keep_resolves", async ({ tab, state }) => {
+    if (state.other.includes(" ")) throw new Error(`expected one losing revision, got ${state.other}`);
+    const kept = (await localCopy(tab, "a", state.other)).note;
+    await tab.click(`${conflictRow("a")} [data-keep="${state.other}"]`);
+    for (const d of ["a", "b"]) {
+      await until(`${d} to drop the conflict`, async () => (await tab.$(conflictRow(d))) === null);
+      await until(`${d} to hold the resolution`, async () => {
+        const c = await localCopy(tab, d);
+        return c.conflicts.length === 0 && c.note === kept;
+      });
+    }
+  }],
+  ["reset", async ({ tab }) => {
+    await tab.evaluate(() => {
+      window.__pulledAgain = new Set();
+      const obs = new MutationObserver(() => {
+        for (const d of ["a", "b"]) {
+          const s = document.querySelector(`section[data-pane="${d}"] [data-role="state"]`);
+          if (s.textContent.startsWith("pulling")) window.__pulledAgain.add(d);
+        }
+      });
+      obs.observe(document.body, { subtree: true, childList: true, characterData: true });
+    });
+    await tab.click("#reset");
+    await tab.click(sel("remote", "reload"));
+    await waitText(tab, "remote", "state", "idle");
+    const events = await text(tab, "remote", "events");
+    const fatal = await text(tab, "remote", "fatal");
+    await until("both devices to pull again", () => tab.evaluate(() => window.__pulledAgain.size === 2));
+    for (const d of ["a", "b"]) {
+      await waitText(tab, d, "events", events);
+      await waitText(tab, d, "fatal", fatal);
+      await waitText(tab, d, "unsynced", 0);
+    }
+    if ((await timelineSeen(tab, "a")) !== "") throw new Error("timeline not cleared");
   }],
 ];
 

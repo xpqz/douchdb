@@ -45,6 +45,19 @@
   ol#log { list-style: none; margin: 0; padding: 0; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 220px; overflow: auto; }
   ol#log li { padding: 2px 0; border-bottom: 1px solid var(--line); }
   .err { color: var(--fatal); }
+  .record { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; font-size: 12.5px; }
+  .picks { display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
+  .picks button { text-align: left; padding: 2px 6px; font-size: 12px; border-color: transparent; background: none; }
+  .picks button:hover { background: var(--accent-soft); }
+  .editor { display: grid; grid-template-columns: max-content 1fr; gap: 4px 8px; align-items: center; margin-top: 6px; }
+  .editor[hidden] { display: none; }
+  code { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .tl { display: grid; grid-template-columns: max-content 1fr max-content; gap: 4px 12px; font-size: 13px; }
+  .tl > div { display: contents; }
+  .tl [data-role=seen] { color: var(--ok); }
+  .conflict { border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; margin-top: 8px; font-size: 12.5px; }
+  .conflict table { border-collapse: collapse; margin: 6px 0; }
+  .conflict td { padding: 2px 8px 2px 0; vertical-align: top; }
 </style>
 </head>
 <body>
@@ -59,10 +72,25 @@
     <label>user <input id="user" value="admin" size="8"></label>
     <label>password <input id="password" type="password" value="secret" size="8"></label>
     <button type="submit" class="primary" id="connect">Connect</button>
+    <button type="button" id="reset" disabled title="Delete both devices' copies and pull again">Reset devices</button>
   </form>
 </header>
 <main>
   <div class="panes" id="panes"></div>
+  <section id="timeline">
+    <div class="head"><h2>Propagation</h2></div>
+    <p class="muted" data-role="target">Save a record on any pane to follow its new revision from copy to copy.</p>
+    <div class="tl">
+      <div data-copy="a"><b>Device A</b><code data-role="rev">–</code><span data-role="seen"></span></div>
+      <div data-copy="cluster"><b>Cluster (node 0)</b><code data-role="rev">–</code><span data-role="seen"></span></div>
+      <div data-copy="b"><b>Device B</b><code data-role="rev">–</code><span data-role="seen"></span></div>
+    </div>
+  </section>
+  <section id="conflicts">
+    <div class="head"><h2>Conflicts</h2></div>
+    <p class="muted" data-role="none">None. Make one by editing the same record on both devices while they are offline.</p>
+    <div data-role="list"></div>
+  </section>
   <section>
     <div class="head"><h2>Event log</h2></div>
     <ol id="log"></ol>
@@ -99,6 +127,18 @@ function paneHtml(key) {
     </div>
     <div class="bars" data-role="phases"></div>
     <p class="muted">${p.note} <button type="button" data-role="reload">Run query again</button></p>
+    <div class="record">
+      <b>Edit a record</b> <span class="muted">— deadliest events, or search by registration</span>
+      <div class="picks" data-role="pick"></div>
+      <input data-role="search" placeholder="registration, then Enter" size="22">
+      <form class="editor" data-role="editor" hidden>
+        <span class="muted">record</span><code data-role="record-id"></code>
+        <span class="muted">revision</span><code data-role="record-rev"></code>
+        <label class="muted" for="fatal-${key}">fatalities</label><input id="fatal-${key}" type="number" min="0" data-role="fatal-input">
+        <label class="muted" for="note-${key}">note</label><input id="note-${key}" data-role="note-input">
+        <span></span><button type="submit" data-role="save">Save ${device ? "on this device" : "on the cluster"}</button>
+      </form>
+    </div>
   </section>`;
 }
 document.getElementById("panes").innerHTML = Object.keys(PANES).map(paneHtml).join("");
@@ -184,6 +224,7 @@ async function refresh(key) {
     refreshing[key] = "again";
     return;
   }
+  if (key !== "remote" && !devices[key].pulled) return;
   refreshing[key] = "busy";
   try {
     do {
@@ -194,6 +235,7 @@ async function refresh(key) {
       const t0 = performance.now();
       const s = await summary(key);
       render(key, s, performance.now() - t0);
+      await showPicks(key, await deadliest(key));
       if (key === "remote") setState(key, "idle");
       else if (!d.indexed) {
         d.indexed = true;
@@ -235,8 +277,11 @@ function makeDevice(key, node) {
     online: el(key, "online").checked, pulled: false, indexed: false, status: "",
     pull: null, sync: null, gen: 0, unsynced: new Set(),
   };
+  d.watched = new Set();
   d.changes = d.db.changes({ since: "now", live: true }).on("change", () => {
-    if (d.pulled) refreshSoon(key);
+    if (!d.pulled) return;
+    refreshSoon(key);
+    conflictsSoon(d);
   });
   return d;
 }
@@ -317,15 +362,307 @@ function goOffline(d) {
   d.status = "offline";
 }
 
+const generation = (rev) => parseInt(rev, 10);
+
+/** Pushed revisions are no longer unsynced; every replicated id is checked for conflicts. */
 function onSyncChange(d, info) {
-  if (info.direction === "push") {
-    for (const doc of info.change.docs) d.unsynced.delete(`${doc._id}@${doc._rev}`);
-    showUnsynced(d);
+  for (const doc of info.change.docs) {
+    if (!doc._id.startsWith("_design/")) d.watched.add(doc._id);
+    if (info.direction !== "push") continue;
+    for (const entry of d.unsynced) {
+      const at = entry.lastIndexOf("@");
+      if (entry.slice(0, at) === doc._id && generation(entry.slice(at + 1)) <= generation(doc._rev)) {
+        d.unsynced.delete(entry);
+      }
+    }
   }
+  showUnsynced(d);
+  conflictsSoon(d);
 }
 
 function showUnsynced(d) {
   el(d.key, "unsynced").textContent = String(d.unsynced.size);
+}
+
+
+// ---- records --------------------------------------------------------------
+
+const opened = {};
+
+async function deadliest(key) {
+  const qs = { descending: true, limit: 10, include_docs: true };
+  if (key === "remote") {
+    return (await remoteJson(`/${DB}/_design/offline/_view/by_fatalities?descending=true&limit=10&include_docs=true`)).rows;
+  }
+  return (await devices[key].db.query("offline/by_fatalities", qs)).rows;
+}
+
+async function byRegistration(key, reg) {
+  const k = reg.replace(/\s+/g, " ").trim().toUpperCase();
+  if (key === "remote") {
+    const qs = `key=${encodeURIComponent(JSON.stringify(k))}&limit=10&include_docs=true`;
+    return (await remoteJson(`/${DB}/_design/offline/_view/by_registration?${qs}`)).rows;
+  }
+  return (await devices[key].db.query("offline/by_registration", { key: k, limit: 10, include_docs: true })).rows;
+}
+
+function showPicks(key, rows) {
+  const list = el(key, "pick");
+  list.replaceChildren();
+  if (rows.length === 0) list.textContent = "No match";
+  for (const r of rows) {
+    const doc = r.doc || {};
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.id = r.id;
+    b.textContent = `${doc.aircraft_registration || r.id} · ${doc.event_date || "?"} · ${doc.total_fatal_injuries ?? 0} fatal`;
+    list.append(b);
+  }
+}
+
+async function readRecord(key, id) {
+  if (key === "remote") return remoteJson(`/${DB}/${encodeURIComponent(id)}`);
+  return devices[key].db.get(id);
+}
+
+async function openRecord(key, id) {
+  el(key, "record-rev").textContent = "";
+  try {
+    const doc = await readRecord(key, id);
+    opened[key] = doc;
+    el(key, "record-id").textContent = doc._id;
+    el(key, "record-rev").textContent = doc._rev;
+    el(key, "fatal-input").value = String(doc.total_fatal_injuries ?? 0);
+    el(key, "note-input").value = doc.demo_note || "";
+    el(key, "editor").hidden = false;
+  } catch (e) {
+    if (key === "remote" && e.message === "offline") setState(key, "offline");
+    log(`${PANES[key].title}: cannot open ${id}: ${e.message}`);
+  }
+}
+
+/** Saves the open record: on the cluster for the remote pane, locally for a device. */
+async function saveRecord(key) {
+  const doc = { ...opened[key] };
+  delete doc._conflicts;
+  doc.total_fatal_injuries = Number(el(key, "fatal-input").value);
+  doc.demo_note = el(key, "note-input").value;
+  try {
+    let rev;
+    if (key === "remote") {
+      const r = await remoteFetch(`/${DB}/${encodeURIComponent(doc._id)}`, { method: "PUT", body: JSON.stringify(doc) });
+      const body = await r.json();
+      if (r.status === 409) {
+        await openRecord(key, doc._id);
+        setState(key, "changed elsewhere, reloaded");
+        log(`Remote: ${doc._id} changed elsewhere since it was opened; reloaded, nothing saved`);
+        return;
+      }
+      if (!r.ok) throw new Error(`${r.status} ${body.reason || body.error}`);
+      rev = body.rev;
+    } else {
+      rev = (await devices[key].db.put(doc)).rev;
+    }
+    opened[key] = { ...doc, _rev: rev };
+    el(key, "record-rev").textContent = rev;
+    if (key === "remote") {
+      refresh(key);
+    } else {
+      const d = devices[key];
+      d.unsynced.add(`${doc._id}@${rev}`);
+      d.watched.add(doc._id);
+      showUnsynced(d);
+    }
+    log(`${PANES[key].title}: saved ${doc._id} as ${rev}`);
+    follow(doc._id, rev);
+  } catch (e) {
+    if (key === "remote" && e.message === "offline") setState(key, "offline");
+    log(`${PANES[key].title}: save failed: ${e.message}`);
+  }
+}
+
+// ---- propagation timeline -------------------------------------------------
+
+let target = null;
+const COPIES = ["a", "cluster", "b"];
+
+function timelineEl(copy, role) {
+  return document.querySelector(`#timeline [data-copy="${copy}"] [data-role="${role}"]`);
+}
+
+function clearTimeline() {
+  target = null;
+  for (const c of COPIES) {
+    timelineEl(c, "rev").textContent = "–";
+    timelineEl(c, "seen").textContent = "";
+  }
+  document.querySelector('#timeline [data-role="target"]').textContent =
+    "Save a record on any pane to follow its new revision from copy to copy.";
+}
+
+/** Follows a new revision: from now on the timeline records when each copy first holds it. */
+function follow(id, rev) {
+  clearTimeline();
+  target = { id, rev, at: Date.now(), seen: {} };
+  document.querySelector('#timeline [data-role="target"]').textContent =
+    `Following ${id} revision ${rev}, saved at ${hhmmss()}. Each copy is read once a second.`;
+  pollTimeline();
+}
+
+async function readCopy(copy, id) {
+  if (copy === "cluster") {
+    const r = await observerFetch(`/${DB}/${encodeURIComponent(id)}?conflicts=true`);
+    if (!r.ok) throw new Error(String(r.status));
+    return r.json();
+  }
+  return devices[copy].db.get(id, { conflicts: true });
+}
+
+async function pollTimeline() {
+  const t = target;
+  if (!t) return;
+  await Promise.all(COPIES.map(async (copy) => {
+    let doc;
+    try {
+      doc = await readCopy(copy, t.id);
+    } catch (e) {
+      if (t === target) timelineEl(copy, "rev").textContent = copy === "cluster" ? "unreachable" : "–";
+      return;
+    }
+    if (t !== target) return;
+    timelineEl(copy, "rev").textContent = doc._rev;
+    const holds = doc._rev === t.rev || (doc._conflicts || []).includes(t.rev);
+    if (holds && !t.seen[copy]) {
+      t.seen[copy] = true;
+      const secs = ((Date.now() - t.at) / 1000).toFixed(1);
+      timelineEl(copy, "seen").textContent = `has it since ${hhmmss()} (+${secs} s)`;
+      log(`${copy === "cluster" ? "Cluster" : PANES[copy].title}: holds ${t.id} ${t.rev}`);
+    }
+  }));
+}
+
+// ---- conflicts ------------------------------------------------------------
+
+const conflictTimers = {};
+function conflictsSoon(d) {
+  clearTimeout(conflictTimers[d.key]);
+  conflictTimers[d.key] = setTimeout(() => checkConflicts(d), 250);
+}
+
+const summaryOf = (doc) => `${doc.total_fatal_injuries ?? 0} fatal · note "${doc.demo_note || ""}"`;
+
+/** Lists the device's watched records that have conflicting revisions. */
+async function checkConflicts(d) {
+  const found = [];
+  for (const id of d.watched) {
+    try {
+      const doc = await d.db.get(id, { conflicts: true });
+      if (doc._conflicts && doc._conflicts.length) {
+        const others = await Promise.all(doc._conflicts.map((rev) => d.db.get(id, { rev })));
+        found.push({ doc, others });
+      }
+    } catch (e) {
+      // Not on this device (yet), or deleted: nothing to resolve.
+    }
+  }
+  if (devices[d.key] !== d) return;
+  const list = document.querySelector('#conflicts [data-role="list"]');
+  for (const row of list.querySelectorAll(`[data-device="${d.key}"]`)) row.remove();
+  for (const { doc, others } of found) list.append(conflictRow(d, doc, others));
+  document.querySelector('#conflicts [data-role="none"]').hidden = list.children.length > 0;
+}
+
+function conflictRow(d, doc, others) {
+  const row = document.createElement("div");
+  row.className = "conflict";
+  row.dataset.device = d.key;
+  row.dataset.conflictId = doc._id;
+  const head = document.createElement("div");
+  head.innerHTML = `<b></b> holds two or more versions of <code></code>. Every copy picks the same winner
+    (the longer history, then the higher revision); the others are kept until someone resolves them.`;
+  head.querySelector("b").textContent = d.label;
+  head.querySelector("code").textContent = doc._id;
+  const table = document.createElement("table");
+  const line = (label, rev, content, keep) => {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = label;
+    const revCell = tr.insertCell();
+    revCell.append(rev);
+    tr.insertCell().textContent = content;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.keep = keep;
+    b.textContent = "Keep this";
+    b.addEventListener("click", () => resolve(d, doc._id, keep === "winner" ? doc._rev : keep));
+    tr.insertCell().append(b);
+  };
+  const code = (role, textValue) => {
+    const c = document.createElement("code");
+    if (role) c.dataset.role = role;
+    c.textContent = textValue;
+    return c;
+  };
+  line("winner", code("winner", doc._rev), summaryOf(doc), "winner");
+  const othersHidden = code("others", doc._conflicts.slice().sort().join(" "));
+  othersHidden.hidden = true;
+  for (const o of others) line("other", code(null, o._rev), summaryOf(o), o._rev);
+  row.append(head, table, othersHidden);
+  return row;
+}
+
+/**
+ * Keeps revision `keep`: its content is written on top of the winner and every
+ * other leaf is deleted, in one bulkDocs. The resolution then syncs like any edit.
+ */
+async function resolve(d, id, keep) {
+  try {
+    const winner = await d.db.get(id, { conflicts: true });
+    const chosen = keep === winner._rev ? winner : await d.db.get(id, { rev: keep });
+    const content = { ...chosen };
+    delete content._conflicts;
+    content._rev = winner._rev;
+    const docs = [content, ...(winner._conflicts || []).map((rev) => ({ _id: id, _rev: rev, _deleted: true }))];
+    const results = await d.db.bulkDocs(docs);
+    const failed = results.filter((r) => r.error);
+    if (failed.length) throw new Error(failed.map((r) => r.message || r.error).join("; "));
+    d.unsynced.add(`${id}@${results[0].rev}`);
+    showUnsynced(d);
+    log(`${d.label}: resolved ${id}, kept ${keep}, now ${results[0].rev}`);
+    follow(id, results[0].rev);
+  } catch (e) {
+    log(`${d.label}: could not resolve ${id}: ${e.message}`);
+  }
+}
+
+// ---- reset ----------------------------------------------------------------
+
+/** Deletes both devices' copies and pulls them again (the cluster side is reset by seed.py). */
+async function resetDevices() {
+  document.getElementById("reset").disabled = true;
+  log("Reset: deleting both devices' copies");
+  for (const key of ["a", "b"]) {
+    const d = devices[key];
+    goOffline(d);
+    d.changes.cancel();
+    await d.db.destroy();
+    el(key, "events").textContent = "–";
+    el(key, "fatal").textContent = "–";
+    el(key, "ms").textContent = "–";
+    el(key, "phases").replaceChildren();
+    el(key, "pick").replaceChildren();
+    el(key, "editor").hidden = true;
+  }
+  clearTimeline();
+  document.querySelector('#conflicts [data-role="list"]').replaceChildren();
+  document.querySelector('#conflicts [data-role="none"]').hidden = false;
+  devices.a = makeDevice("a", cfg.node0);
+  devices.b = makeDevice("b", cfg.node2);
+  for (const key of ["a", "b"]) {
+    showUnsynced(devices[key]);
+    if (devices[key].online) goOnline(devices[key]);
+    else goOffline(devices[key]);
+  }
+  document.getElementById("reset").disabled = false;
 }
 
 // ---- wiring ---------------------------------------------------------------
@@ -347,6 +684,22 @@ for (const key of Object.keys(PANES)) {
     if (on) goOnline(d);
     else goOffline(d);
   });
+  el(key, "pick").addEventListener("click", (ev) => {
+    const id = ev.target.closest("button[data-id]")?.dataset.id;
+    if (id) openRecord(key, id);
+  });
+  el(key, "search").addEventListener("keydown", async (ev) => {
+    if (ev.key !== "Enter" || !cfg.node0 || !ev.target.value.trim()) return;
+    try {
+      showPicks(key, await byRegistration(key, ev.target.value));
+    } catch (e) {
+      log(`${PANES[key].title}: search failed: ${e.message}`);
+    }
+  });
+  el(key, "editor").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    saveRecord(key);
+  });
   el(key, "reload").addEventListener("click", () => {
     if (!cfg.node0) return;
     if (key === "remote" || devices[key].pulled) refresh(key);
@@ -367,7 +720,11 @@ function connect() {
     if (devices[key].online) goOnline(devices[key]);
     else goOffline(devices[key]);
   }
+  document.getElementById("reset").disabled = false;
+  setInterval(pollTimeline, 1000);
 }
+
+document.getElementById("reset").addEventListener("click", resetDevices);
 
 document.getElementById("signin").addEventListener("submit", (ev) => {
   ev.preventDefault();
