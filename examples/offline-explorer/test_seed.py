@@ -15,9 +15,12 @@ class SeedTest(unittest.TestCase):
         for k, v in d["views"].items():
             self.assertEqual(v, src[k])
 
-    def test_slice_selector(self):
-        self.assertEqual(seed.slice_selector(),
-                         {"event_date": {"$gte": "2006-01-01", "$lt": "2008-01-01"}})
+    def test_in_slice_takes_2006_and_2007_only(self):
+        for date, want in [("2005-12-31", False), ("2006-01-01", True), ("2007-12-31", True),
+                           ("2008-01-01", False), (None, False)]:
+            self.assertEqual(seed.in_slice({"_id": "x", "event_date": date}), want, date)
+        self.assertFalse(seed.in_slice({"_id": "y"}))
+        self.assertFalse(seed.in_slice({"_id": "_design/explore", "event_date": "2006-05-05"}))
 
     def test_prepare_drops_rev_only(self):
         self.assertEqual(seed.prepare({"_id": "x", "_rev": "1-a", "n": 1}), {"_id": "x", "n": 1})

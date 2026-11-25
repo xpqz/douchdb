@@ -61,8 +61,9 @@ reference.
   `offline_demo`, by a seed script in the example (my call). The script
   deletes and recreates `offline_demo`, copies the documents whose
   `event_date` (stored as ISO `YYYY-MM-DD`) satisfies `$gte "2006-01-01"` and
-  `$lt "2008-01-01"` (read with `_find` from `airline_accidents`, written
-  without revisions), and installs `_design/offline`. The demo's edits then
+  `$lt "2008-01-01"` (read by paging `_all_docs?include_docs=true` of
+  `airline_accidents`, since douchdb has no Mango `_find`; written without
+  revisions), and installs `_design/offline`. The demo's edits then
   never touch the imported datasets, re-running the script resets the
   cluster side in seconds, and every copy holds exactly the same documents,
   so the "same totals" step cannot drift. (douchdb has no client-facing

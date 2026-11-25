@@ -2,7 +2,7 @@
 """Create the offline explorer's database, offline_demo.
 
 Deletes and recreates offline_demo, fills it with the airline_accidents events
-dated 2006-2007 (or, with --fixture N, N synthetic events for tests) and
+dated 2006-2007 (read through _all_docs) (or, with --fixture N, N synthetic events for tests) and
 installs _design/offline, whose views are the aviation explorer's own. Re-run
 it to reset the cluster side of the demo.
 
@@ -17,7 +17,7 @@ import views  # noqa: E402  (the explorer's view definitions)
 DB = "offline_demo"
 SOURCE = "airline_accidents"
 VIEWS = ["by_date", "by_phase", "by_fatalities", "by_registration"]
-PAGE = 2000
+PAGE = 5000
 BATCH = 500
 PHASES = ["TAKEOFF", "CRUISE", "APPROACH", "LANDING", "TAXI"]
 
@@ -29,9 +29,11 @@ def design_doc():
             "views": {name: source[name] for name in VIEWS}}
 
 
-def slice_selector():
-    """The 2006-2007 events (event_date is an ISO YYYY-MM-DD string)."""
-    return {"event_date": {"$gte": "2006-01-01", "$lt": "2008-01-01"}}
+def in_slice(doc):
+    """True for the 2006-2007 events (event_date is an ISO YYYY-MM-DD string)."""
+    date = doc.get("event_date")
+    return (not doc["_id"].startswith("_design/") and isinstance(date, str)
+            and "2006-01-01" <= date < "2008-01-01")
 
 
 def prepare(doc):
@@ -88,15 +90,17 @@ def main():
     if a.fixture is not None:
         docs = fixture_docs(a.fixture)
     else:
-        docs, skip = [], 0
+        # douchdb has no Mango (_find): page through _all_docs and keep the slice.
+        docs, start = [], None
         while True:
-            page = check(*req("POST", f"/{SOURCE}/_find",
-                              {"selector": slice_selector(), "limit": PAGE, "skip": skip}),
-                         f"read {SOURCE}")["docs"]
-            docs.extend(prepare(d) for d in page)
-            if len(page) < PAGE:
+            qs = f"include_docs=true&limit={PAGE + 1}"
+            if start is not None:
+                qs += "&startkey=" + urllib.parse.quote(json.dumps(start))
+            rows = check(*req("GET", f"/{SOURCE}/_all_docs?{qs}"), f"read {SOURCE}")["rows"]
+            page, start = rows[:PAGE], (rows[PAGE]["id"] if len(rows) > PAGE else None)
+            docs.extend(prepare(r["doc"]) for r in page if r.get("doc") and in_slice(r["doc"]))
+            if start is None:
                 break
-            skip += PAGE
 
     for i in range(0, len(docs), BATCH):
         rows = check(*req("POST", f"/{DB}/_bulk_docs", {"docs": docs[i:i + BATCH]}), "write")
