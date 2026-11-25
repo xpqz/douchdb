@@ -138,6 +138,7 @@ class SeedTest(unittest.TestCase):
   - `[data-role=events]` and `[data-role=fatal]` (integers, no separators)
   - `[data-role=ms]` (the last query's time)
   - `[data-role=phases]` (the breakdown)
+  - `[data-role=reload]` (a button that reruns the summary)
   - devices only: `[data-role=unsynced]` (an integer)
 - `#log`: the event log, newest first, capped at 200 lines.
 - Page functions used by later tasks:
