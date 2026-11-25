@@ -57,9 +57,36 @@ impl NodeHealth {
 /// node's listener accepts it, and ALPN to `https://` peers.
 pub(crate) fn peer_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
     use crate::listener::peer_h2;
-    let builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(60));
+    h2_client(tls_peers, peer_h2::CONNECTION_WINDOW)
+        .timeout(Duration::from_secs(60))
+        .build()
+}
+
+/// Unread data a peer may send on the stream client's connection to one
+/// peer, over all of its streams: 64 streams' windows.
+const STREAM_CONNECTION_WINDOW: u32 = 64 * crate::listener::peer_h2::STREAM_WINDOW;
+
+/// The client for peer replies read as they arrive, such as a view's rows,
+/// which can take longer than any fixed deadline. A peer silent for 60 s
+/// fails the read; one that keeps sending has no deadline.
+///
+/// It is HTTP/2 like `peer_client`, so a stream the reader drops part way
+/// (a merge that has its page) is cancelled on its own and the connection
+/// is kept for the next one. It has its own connection, apart from the one
+/// that carries this node's other peer calls: a reader that stops (a slow
+/// client) holds back its own stream once that stream's window is full, and
+/// the other streams on this connection only after 64 such stalls.
+pub(crate) fn peer_stream_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
+    h2_client(tls_peers, STREAM_CONNECTION_WINDOW)
+        .read_timeout(Duration::from_secs(60))
+        .build()
+}
+
+/// An HTTP/2 client to peers, with the flow-control windows, frame size and
+/// keep-alive the peers' listeners use.
+fn h2_client(tls_peers: bool, connection_window: u32) -> reqwest::ClientBuilder {
+    use crate::listener::peer_h2;
+    let builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(2));
     let builder = if tls_peers {
         builder
     } else {
@@ -67,26 +94,11 @@ pub(crate) fn peer_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
     };
     builder
         .http2_initial_stream_window_size(peer_h2::STREAM_WINDOW)
-        .http2_initial_connection_window_size(peer_h2::CONNECTION_WINDOW)
+        .http2_initial_connection_window_size(connection_window)
         .http2_max_frame_size(peer_h2::MAX_FRAME)
         .http2_keep_alive_interval(peer_h2::PING_INTERVAL)
         .http2_keep_alive_timeout(peer_h2::PING_TIMEOUT)
         .http2_keep_alive_while_idle(true)
-        .build()
-}
-
-/// The client for peer replies read as they arrive, such as a view's rows,
-/// which can take longer than any fixed deadline. A peer silent for 60 s
-/// fails the read; one that keeps sending has no deadline. Each stream has
-/// its own HTTP/1.1 connection, so a reader that stops (a slow client)
-/// holds back only its own peer, through TCP, and never the shared HTTP/2
-/// connection that carries this node's other peer calls.
-pub(crate) fn peer_stream_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .read_timeout(Duration::from_secs(60))
-        .http1_only()
-        .build()
 }
 
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
