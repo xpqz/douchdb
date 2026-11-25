@@ -4,6 +4,9 @@ A single-page explorer for the four Kaggle aviation datasets (see
 `docs/kaggle-import.md`), served by a three-node douchdb cluster and read
 entirely through the CouchDB HTTP API from the browser.
 
+For the other way of using douchdb, with a local PouchDB copy in the browser
+that syncs with the cluster, see [the offline-first explorer](../offline-explorer).
+
 - `views.py` installs `_design/explore` in each database: `_stats` views by
   date (`[year, month]`), make, flight phase, weather, country/state and more,
   each with a `[value, year]` twin for drill-down, plus lookups for the
