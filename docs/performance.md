@@ -414,9 +414,14 @@ What the numbers say:
   about one entry per 64 rows.
 - `group=true` with a limit is far faster: only the first `skip + limit`
   groups of each shard are reduced.
-- `group_level` reduce over groups that start and end mid-block is about 9x
+- `group_level` reduce over groups that start and end mid-block was about 9x
   slower. Each group's edges, up to 128 rows, are read from the file and
-  reduced, and its end is found with a few seeks.
+  reduced, and its end is found with a few seeks. Since #196 (2026-11-25) a
+  block list keeps each block's first key once read, a query reads each block
+  it searches or takes edges from once, and built-in reducers that read only
+  values (`_count`, `_sum`, `_stats`) decode only the edges' values. Measured
+  on 100,000 documents (one 400,000-row view, 100 groups): 64 ms before, 13.5
+  ms after, against 3.1 ms in memory.
 - Updates cost about twice as much: each changed row is written to the
   by-document and the key-ordered tables and counted in its block. A build
   is about 1.6x slower for the same reason, but no longer holds the view in

@@ -493,6 +493,11 @@ pub(crate) struct ShardBlocks {
     starts: Vec<u64>,
     /// The shard's rows.
     pub total: u64,
+    /// Each block's first row's key, once read: searches probe block starts
+    /// first, and a cached block list (see `view::ShardCache`) keeps them for
+    /// the next query. Its fence may sort below it, so it is read, not taken
+    /// from the fence.
+    first_keys: Vec<std::sync::OnceLock<Vec<u8>>>,
 }
 
 impl ShardBlocks {
@@ -538,12 +543,14 @@ pub(crate) fn shard_blocks(
         fences: Vec::new(),
         starts: Vec::new(),
         total: 0,
+        first_keys: Vec::new(),
     };
     for entry in range {
         let (fence, stored) = entry.map_err(store_error)?;
         shard_blocks.fences.push(fence.value().to_vec());
         shard_blocks.starts.push(shard_blocks.total);
         shard_blocks.total += read_count(stored.value())?;
+        shard_blocks.first_keys.push(std::sync::OnceLock::new());
     }
     if shard_blocks.fences.first() != Some(&start) {
         return Err(JsError::Index(format!(
@@ -600,18 +607,28 @@ pub(crate) fn read_at(
         .collect()
 }
 
-/// The `ViewKey` of the shard's row at position `at`, if there is one.
+/// The block position `at` falls in, if the shard has a row there.
+pub(crate) fn block_of(blocks: &ShardBlocks, at: u64) -> Option<usize> {
+    (at < blocks.total).then(|| blocks.starts.partition_point(|&start| start <= at) - 1)
+}
+
+/// The `ViewKey` of the shard's row at position `at`, if there is one. A
+/// block's first key is kept once read.
 pub(crate) fn read_key_at(
     by_key: &impl ReadableTable<ViewKey, &'static [u8]>,
     blocks: &ShardBlocks,
     at: u64,
 ) -> Result<Option<Vec<u8>>, JsError> {
-    if at >= blocks.total {
+    let Some(block) = block_of(blocks, at) else {
         return Ok(None);
-    }
-    let block = blocks.starts.partition_point(|&start| start <= at) - 1;
+    };
     let skip = usize::try_from(at - blocks.starts[block]).map_err(store_error)?;
-    by_key
+    if skip == 0 {
+        if let Some(first) = blocks.first_keys[block].get() {
+            return Ok(Some(first.clone()));
+        }
+    }
+    let key = by_key
         .range::<&[u8]>(blocks.fences[block].as_slice()..)
         .map_err(store_error)?
         .nth(skip)
@@ -619,7 +636,30 @@ pub(crate) fn read_key_at(
             let (key, _) = entry.map_err(store_error)?;
             Ok(key.value().to_vec())
         })
-        .transpose()
+        .transpose()?;
+    if let (0, Some(key)) = (skip, &key) {
+        let _ = blocks.first_keys[block].set(key.clone());
+    }
+    Ok(key)
+}
+
+/// Every stored entry of block `block`, in order, read in one pass.
+pub(crate) fn read_block(
+    by_key: &impl ReadableTable<ViewKey, &'static [u8]>,
+    blocks: &ShardBlocks,
+    block: usize,
+) -> Result<Vec<StoredEntry>, JsError> {
+    let count = usize::try_from(blocks.end(block) - blocks.start(block)).map_err(store_error)?;
+    let entries = read_at(by_key, blocks, blocks.start(block), count)?;
+    if entries.len() != count {
+        return Err(JsError::Index(
+            "view index: a block holds fewer rows than its count".into(),
+        ));
+    }
+    if let Some((first, _)) = entries.first() {
+        let _ = blocks.first_keys[block].set(first.clone());
+    }
+    Ok(entries)
 }
 
 /// Check the invariants of the key-ordered tables against `rows` (the
