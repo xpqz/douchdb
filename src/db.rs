@@ -2766,6 +2766,54 @@ impl Db {
         })
     }
 
+    /// One node's part of a clustered `_changes` read, as JSON lines for a
+    /// coordinator that merges nodes' streams (`fabric::cluster_changes_stream`):
+    /// first `{"since": token}`, this node's starting position on each of
+    /// `opts.owned`'s shards; then each change, its `seq` naming only its own
+    /// shard; `{"scanned": token}` when a shard has been read to its end
+    /// without a row there (a filter discarded the rest); and last
+    /// `{"end": true, "last_seq": token, "pending": n}`. A stream that stops
+    /// before its end line was cut.
+    pub(crate) fn changes_lines(
+        db: Arc<Db>,
+        me: usize,
+        opts: ChangesOpts,
+    ) -> impl futures::Stream<Item = DbResult<String>> + Send + 'static {
+        use futures::StreamExt;
+        async_stream::stream! {
+            let selected: Vec<usize> = db.selected_shards(opts.owned.as_ref());
+            let mut progress = opts.since.clone();
+            let (owned, descending) = (opts.owned.clone(), opts.descending);
+            yield Ok(json!({"since": db.local_token(me, &selected, &progress)}).to_string());
+            let mut rows = Box::pin(Db::changes_stream_arc(Arc::clone(&db), opts));
+            while let Some(item) = rows.next().await {
+                match item {
+                    Ok(ChangesItem::Row(row)) => {
+                        progress.0[row.shard] = row.seq;
+                        let token = db.local_token(me, &[row.shard], &progress);
+                        yield Ok(Db::change_row_json(&row, &format!("\"{token}\"")));
+                    }
+                    Ok(ChangesItem::Scanned(shard, seq)) => {
+                        progress.0[shard] = seq;
+                        let token = db.local_token(me, &[shard], &progress);
+                        yield Ok(json!({"scanned": token}).to_string());
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+            match db.changes_pending(&progress, descending, owned.as_ref()).await {
+                Ok(pending) => {
+                    let last_seq = db.local_token(me, &selected, &progress);
+                    yield Ok(json!({"end": true, "last_seq": last_seq, "pending": pending}).to_string());
+                }
+                Err(error) => yield Err(error),
+            }
+        }
+    }
+
     /// Stream changes rows shard by shard, a page at a time, so a full feed
     /// does not materialize the whole response. After each shard it yields
     /// that shard's position, the bound it was read to.
