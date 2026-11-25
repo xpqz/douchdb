@@ -167,20 +167,82 @@ async fn changes_normal(
         headers,
         ..
     } = req;
+    if st.ctx.cluster.wants_stream(headers) {
+        return changes_peer_stream(st, db, q, body, headers).await;
+    }
     if let Some(response) = changes_normal_raw(st, db, q, body, headers, opts.local_only).await {
         return response;
     }
+    if st.ctx.cluster.is_clustered() && !opts.local_only && !flag(q, "descending") {
+        let read = ClusterRead {
+            ctx: &st.ctx,
+            db,
+            dbname,
+            headers,
+        };
+        return match crate::fabric::cluster_changes_stream(read, db.clone(), q, body).await {
+            Ok(stream) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| fail(ApiError::internal("building the changes response"))),
+            Err(error) => fail(error),
+        };
+    }
     match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
-        Ok((page, false)) => json_of(StatusCode::OK, &page),
-        Ok((page, true)) => {
-            changes_normal_paged(st.clone(), db.clone(), dbname, q, body, headers, page)
-        }
+        Ok((page, _)) => json_of(StatusCode::OK, &page),
         Err(e) => fail(e),
     }
 }
 
-/// A clustered `feed=normal` read too large for one page: the first page is
-/// read already (so an error still gets its own status); the rest stream.
+/// This node's part of a coordinator's streamed `_changes` read, as
+/// newline-delimited JSON (`Db::changes_lines`). An error after the status
+/// is sent ends the body before its end line.
+async fn changes_peer_stream(
+    st: &AppState,
+    db: &Arc<Db>,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
+    let since = match parse_since(q.get("since").map(String::as_str)) {
+        Ok(since) => since,
+        Err(error) => return fail(error),
+    };
+    let opts = match changes_options(st, db, q, body, headers, &since).await {
+        Ok(opts) => opts,
+        Err(error) => return fail(error),
+    };
+    let lines = Db::changes_lines(db.clone(), st.ctx.cluster.me, opts);
+    let stream = async_stream::stream! {
+        let mut lines = Box::pin(lines);
+        let mut buffer = Vec::with_capacity(64 * 1024);
+        while let Some(line) = lines.next().await {
+            match line {
+                Ok(line) => {
+                    buffer.extend_from_slice(line.as_bytes());
+                    buffer.push(b'\n');
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!("{}: {}", error.error, error.reason)));
+                    return;
+                }
+            }
+            if buffer.len() >= 64 * 1024 {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        yield Ok(Bytes::from(buffer));
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| fail(ApiError::internal("building the changes response")))
+}
+
+/// A clustered `feed=longpoll` read too large for one page: the first page
+/// is read already (so an error still gets its own status); the rest stream.
 fn changes_normal_paged(
     st: Arc<AppState>,
     db: Arc<Db>,

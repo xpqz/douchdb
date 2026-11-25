@@ -2499,9 +2499,9 @@ async fn open_view_lane(
     .await
 }
 
-/// Open a peer's stream of rows (an internal request marked with
-/// `cluster::STREAM_HEADER`): newline-delimited JSON, a line of counts, the rows, and
-/// an end line. It returns once the counts are in.
+/// Open a peer's stream of rows for a view or `_all_docs` (see
+/// `open_peer_lines`), whose first line holds the counts. It returns once
+/// they are in.
 async fn open_peer_lane(
     read: ClusterRead<'_>,
     node: usize,
@@ -2509,6 +2509,38 @@ async fn open_peer_lane(
     params: &[(&str, String)],
     failed: &'static str,
 ) -> DbResult<RowLane> {
+    let (head, lines) = open_peer_lines(read, node, segments, params, None, failed).await?;
+    let count = |name: &str| {
+        head.get(name)
+            .and_then(Value::as_u64)
+            .map(|count| count as usize)
+            .ok_or_else(|| ApiError::new(502, "bad_gateway", "a peer stream without counts"))
+    };
+    let (total_rows, offset) = (count("total_rows")?, count("offset")?);
+    let rows = lines.filter(|line| {
+        let row = !matches!(line, Ok(line) if line.get("end").is_some());
+        futures::future::ready(row)
+    });
+    Ok(RowLane {
+        total_rows,
+        offset,
+        rows: rows.boxed(),
+    })
+}
+
+/// Open a peer's stream (an internal request marked with
+/// `cluster::STREAM_HEADER`): newline-delimited JSON, a head line, the rows
+/// and an end line (one with `end`). It returns once the head line is in,
+/// with the lines after it, the end line included; a body that stops before
+/// its end line ends the lines with an error.
+async fn open_peer_lines(
+    read: ClusterRead<'_>,
+    node: usize,
+    segments: &[&str],
+    params: &[(&str, String)],
+    body: Option<Value>,
+    failed: &'static str,
+) -> DbResult<(Value, futures::stream::BoxStream<'static, DbResult<Value>>)> {
     let ClusterRead { ctx, headers, .. } = read;
     let peer = &ctx.cluster.nodes[node];
     let request = crate::cluster_http::internal_request_raw(
@@ -2521,6 +2553,10 @@ async fn open_peer_lane(
     let request = crate::cluster_http::forward_client_auth(request, headers)
         .header(crate::cluster::STREAM_HEADER, "1")
         .query(params);
+    let request = match body {
+        Some(body) => request.json(&body),
+        None => request,
+    };
     let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
@@ -2536,19 +2572,14 @@ async fn open_peer_lane(
         Some(head) => head?,
         None => return Err(peer_stream_cut()),
     };
-    let count = |name: &str| {
-        head.get(name)
-            .and_then(Value::as_u64)
-            .map(|count| count as usize)
-            .ok_or_else(|| ApiError::new(502, "bad_gateway", "a peer stream without counts"))
-    };
-    let (total_rows, offset) = (count("total_rows")?, count("offset")?);
-    // Rows up to the end marker; a stream that stops before it was cut.
-    let rows = async_stream::stream! {
+    let rest = async_stream::stream! {
         let mut lines = lines;
         loop {
             match lines.next().await {
-                Some(Ok(line)) if line.get("end").is_some() => return,
+                Some(Ok(line)) if line.get("end").is_some() => {
+                    yield Ok(line);
+                    return;
+                }
                 Some(Ok(row)) => yield Ok(row),
                 Some(Err(error)) => {
                     yield Err(error);
@@ -2561,11 +2592,7 @@ async fn open_peer_lane(
             }
         }
     };
-    Ok(RowLane {
-        total_rows,
-        offset,
-        rows: rows.boxed(),
-    })
+    Ok((head, rest.boxed()))
 }
 
 fn peer_stream_cut() -> ApiError {
@@ -2996,6 +3023,242 @@ pub(crate) async fn fetch_node_changes(
     }
 
     let peer = &ctx.cluster.nodes[node];
+    let params = node_changes_params(&changes, mask, start, limit);
+    let request = internal_request(
+        ctx,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, "_changes"],
+        Some(headers),
+    )
+    .query(&params);
+    let request = if let Some(ids) = doc_ids {
+        request.json(&json!({"doc_ids": ids}))
+    } else {
+        request
+    };
+    let response = send_peer(request)
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "changes_failed", text));
+    }
+    response
+        .json::<ChangesList>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
+/// A clustered `feed=normal` `_changes` read, streamed: every node streams
+/// its shards' changes (`Db::changes_lines`) and the coordinator writes them
+/// as they arrive, each row's `seq` the position of every shard so far. A
+/// node that fails before its first line fails over to another copy, as for
+/// `cluster_changes`; one that fails later ends the body early.
+///
+/// With `limit`, each node sends at most `limit` rows (a filtered read: all
+/// it matches, since the filter decides how many). Rows past the limit are
+/// read but only counted, into `pending`, and a shard with such rows keeps
+/// the position of its last returned row; every other shard ends where its
+/// node finished reading it, as in `cluster_changes`.
+pub(crate) async fn cluster_changes_stream(
+    read: ClusterRead<'_>,
+    owned: Arc<Db>,
+    q: &HashMap<String, String>,
+    body: &[u8],
+) -> DbResult<futures::stream::BoxStream<'static, Result<axum::body::Bytes, std::io::Error>>> {
+    let ClusterRead { ctx, db, .. } = read;
+    let since = parse_since(q.get("since").map(String::as_str))?;
+    let limit = num(q, "limit");
+    let named: &[CopyPos] = match &since {
+        Since::Token(copies) => copies,
+        Since::Zero | Since::Now => &[],
+    };
+    let owned_by_node = token_shard_masks(ctx, db, named);
+    let doc_ids = doc_ids_from(q, body);
+    let change_filter = resolve_changes_filter(db, q).await?;
+    let changes = ChangesFetch {
+        include_docs: flag(q, "include_docs"),
+        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
+        doc_ids: doc_ids.as_deref(),
+        filter: change_filter.as_ref(),
+        q,
+    };
+    let node_limit = if change_filter.is_some() { None } else { limit };
+    let (since_ref, owned) = (&since, &owned);
+    let lanes = scatter(
+        read,
+        &owned_by_node,
+        "changes",
+        |node, mask, _| async move {
+            // A node gets only the positions of its own copies; any shard it
+            // reads without one (it took over from a copy that failed) starts
+            // from 0.
+            let start = match since_ref {
+                Since::Now => Since::Now,
+                Since::Zero => Since::Zero,
+                Since::Token(copies) => Since::Token(
+                    copies
+                        .iter()
+                        .filter(|copy| copy.node == node && mask.covers(copy.shard))
+                        .cloned()
+                        .collect(),
+                ),
+            };
+            if node == ctx.cluster.me {
+                let opts = ChangesOpts {
+                    since: db.shard_since(node, &start),
+                    limit: node_limit,
+                    include_docs: changes.include_docs,
+                    style_all_docs: changes.style_all_docs,
+                    descending: false,
+                    doc_ids: changes.doc_ids.map(|ids| ids.to_vec()),
+                    filter: changes.filter.cloned(),
+                    conflicts: flag(q, "conflicts"),
+                    owned: Some(mask.clone()),
+                    until: None,
+                };
+                let mut lines = Db::changes_lines(Arc::clone(owned), node, opts)
+                    .map(|line| {
+                        line.and_then(|line| {
+                            serde_json::from_str::<Value>(&line).map_err(ApiError::internal)
+                        })
+                    })
+                    .boxed();
+                let head = match lines.next().await {
+                    Some(head) => head?,
+                    None => return Err(ApiError::internal("a changes stream without a start")),
+                };
+                return Ok((head, lines));
+            }
+            let params = node_changes_params(&changes, &mask, &start, node_limit);
+            let ids = changes.doc_ids.map(|ids| json!({"doc_ids": ids}));
+            open_peer_lines(
+                read,
+                node,
+                &[read.dbname, "_changes"],
+                &params,
+                ids,
+                "changes_failed",
+            )
+            .await
+        },
+    )
+    .await?;
+
+    // Every shard's position, by shard, so a token lists them in order.
+    let mut progress: BTreeMap<usize, CopyPos> = BTreeMap::new();
+    let mut streams = Vec::new();
+    for (_, _, (head, lines)) in lanes {
+        let start = head
+            .get("since")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for pos in crate::since::decode(start).map_err(bad_token)? {
+            progress.insert(pos.shard, pos);
+        }
+        streams.push(lines);
+    }
+    let limit = limit.unwrap_or(usize::MAX);
+    let body = async_stream::stream! {
+        let mut lines = futures::stream::select_all(streams);
+        let mut buffer = String::from("{\"results\":[");
+        let (mut sent, mut pending) = (0usize, 0u64);
+        // Shards with rows read past the limit: they keep the position of
+        // their last returned row.
+        let mut held: BTreeSet<usize> = BTreeSet::new();
+        let fail = |error: ApiError| std::io::Error::other(format!("{}: {}", error.error, error.reason));
+        while let Some(line) = lines.next().await {
+            let mut line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    yield Err(fail(error));
+                    return;
+                }
+            };
+            let token = |name: &str, line: &Value| {
+                crate::since::decode(line.get(name).and_then(Value::as_str).unwrap_or_default())
+                    .map_err(bad_token)
+            };
+            if line.get("end").is_some() {
+                match token("last_seq", &line) {
+                    Ok(ends) => {
+                        for end in ends {
+                            if !held.contains(&end.shard) {
+                                progress.insert(end.shard, end);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(fail(error));
+                        return;
+                    }
+                }
+                pending += line.get("pending").and_then(Value::as_u64).unwrap_or(0);
+                continue;
+            }
+            let (name, row) = match line.get("scanned") {
+                Some(_) => ("scanned", false),
+                None => ("seq", true),
+            };
+            let pos = match token(name, &line).map(|mut copies| copies.pop()) {
+                Ok(Some(pos)) => pos,
+                Ok(None) => {
+                    yield Err(fail(bad_token("a row without a position")));
+                    return;
+                }
+                Err(error) => {
+                    yield Err(fail(error));
+                    return;
+                }
+            };
+            if row && sent >= limit {
+                pending += 1;
+                held.insert(pos.shard);
+                continue;
+            }
+            if held.contains(&pos.shard) {
+                continue;
+            }
+            progress.insert(pos.shard, pos);
+            if !row {
+                continue;
+            }
+            line["seq"] = Value::String(encode_progress(&progress));
+            if sent > 0 {
+                buffer.push(',');
+            }
+            buffer.push_str(&line.to_string());
+            sent += 1;
+            if buffer.len() >= 64 * 1024 {
+                yield Ok(axum::body::Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        buffer.push_str("],\"last_seq\":");
+        buffer.push_str(&Value::String(encode_progress(&progress)).to_string());
+        buffer.push_str(&format!(",\"pending\":{pending}}}"));
+        yield Ok(axum::body::Bytes::from(buffer));
+    };
+    Ok(body.boxed())
+}
+
+/// The query a node is sent for its part of a clustered `_changes` read
+/// from the shards in `mask`, starting at `start`. A `doc_ids` read also
+/// sends the ids as its body.
+fn node_changes_params<'a>(
+    changes: &ChangesFetch<'a>,
+    mask: &ShardMask,
+    start: &Since,
+    limit: Option<usize>,
+) -> Vec<(&'a str, String)> {
+    let ChangesFetch {
+        include_docs,
+        style_all_docs,
+        doc_ids,
+        q,
+        ..
+    } = *changes;
     let selected = mask.query_value();
     let since = match start {
         Since::Now => "now".to_string(),
@@ -3047,33 +3310,10 @@ pub(crate) async fn fetch_node_changes(
         .collect();
     extra.sort();
     params.extend(extra);
-    let request = internal_request(
-        ctx,
-        reqwest::Method::GET,
-        peer,
-        &[dbname, "_changes"],
-        Some(headers),
-    )
-    .query(&params);
-    let request = if let Some(ids) = doc_ids {
-        request
-            .query(&[("filter", "_doc_ids")])
-            .json(&json!({"doc_ids": ids}))
-    } else {
-        request
-    };
-    let response = send_peer(request)
-        .await
-        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(ApiError::new(status, "changes_failed", text));
+    if doc_ids.is_some() {
+        params.push(("filter", "_doc_ids".to_string()));
     }
-    response
-        .json::<ChangesList>()
-        .await
-        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+    params
 }
 
 /// One node's copy of a shard, as a coordinator's `GET /db` reads it:

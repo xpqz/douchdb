@@ -7643,10 +7643,11 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows[0]["deleted"], true);
 }
 
-/// A clustered feed reads the nodes a page at a time (1000 rows a node), so
-/// a coordinator never holds a whole shard's changes. Every row still arrives
-/// once, `limit` and `pending` still hold across pages, and a continuous feed
-/// reads on through the pages without waiting for a commit.
+/// A clustered normal feed streams each node's changes and a continuous one
+/// reads the nodes a page at a time (1000 rows a node), so a coordinator
+/// never holds a whole shard's changes. Every row still arrives once,
+/// `limit` and `pending` still hold, and a continuous feed reads on through
+/// the pages without waiting for a commit.
 #[tokio::test]
 async fn cluster_changes_page_through_large_shards() {
     // One shard on one node, then four spread over the three nodes, each
