@@ -15,8 +15,15 @@ outside review).
 - **Partials are written without a sync.** They are a cache: losing them
   loses no data and changes no answer, only makes the next reduce compute
   them again. So the write a reduce query makes for them uses redb's
-  non-durable commit, and a reduce read never waits for a sync. Every other
-  index write stays fully durable.
+  non-durable commit, and a reduce read never waits for a sync.
+- **Index updates sync at most every 60 s** (agreed 2026-11-25, #197). An
+  update commits without a sync unless 60 s have passed since the file was
+  last durable; the next durable commit, or closing the index, makes the
+  ones before it durable. The index is derived from its documents and its
+  rows commit with its cursor, so a crash only takes it back to its last
+  durable commit, from where it reads those changes again. Measured: the
+  sync of a commit that touches thousands of scattered pages was about two
+  thirds of an update. Rebuilds still finish with a durable commit.
 - **Queries work in row positions, not bound keys** (agreed 2026-11-24, step
   3). A query's start and end, `key` and each `keys` entry become positions
   in a shard's rows through the block counts. The selection code that works
@@ -146,7 +153,10 @@ structure can be built on it.
   keys, so an update removes exactly the keyed rows it wrote, by their bytes,
   without comparing values. The value is no longer stored here.
 - `BY_KEY: ViewKey → sealed value`, where a stored `ViewKey` is
-  (shard u32, partition, encoded view key, doc id, ordinal). Two other
+  (shard u32, partition, encoded view key, doc id, ordinal). The doc id's
+  length is stored after the id, just before the ordinal (#197), so a
+  comparison finds a key's parts from both ends without walking the
+  encoded view key. Two other
   forms are never stored as rows: a shard's sentinel (fence of its first
   block) and a partition's start (see Positions). The ordinal is the row's emit index within its
   document, in updates and rebuilds alike. It keeps equal (key, id) rows in
