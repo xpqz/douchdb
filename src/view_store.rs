@@ -99,8 +99,9 @@ struct Parsed<'a> {
 enum Place<'a> {
     Sentinel,
     PartitionStart(&'a [u8]),
-    /// Partition, encoded view key, doc id, ordinal.
-    Row(&'a [u8], &'a [u8], &'a str, u32),
+    /// Partition, encoded view key, doc id (UTF-8, checked only when a row
+    /// is read back: ids compare as bytes), ordinal.
+    Row(&'a [u8], &'a [u8], &'a [u8], u32),
 }
 
 fn parse(bytes: &[u8]) -> Option<Parsed<'_>> {
@@ -116,11 +117,14 @@ fn parse(bytes: &[u8]) -> Option<Parsed<'_>> {
             Place::PartitionStart(partition)
         }
         ROW => {
+            // The id's length and the ordinal end the key, so its parts are
+            // found from both ends without reading the encoded view key.
             let (partition, rest) = take_text(rest)?;
-            let (key, rest) = crate::collate::split_key(rest)?;
-            let split = rest.len().checked_sub(4)?;
-            let ordinal = u32::from_be_bytes(rest[split..].try_into().ok()?);
-            Place::Row(partition, key, whole_text(&rest[..split])?, ordinal)
+            let tail = rest.len().checked_sub(6)?;
+            let ordinal = u32::from_be_bytes(rest[tail + 2..].try_into().ok()?);
+            let id_len = usize::from(u16::from_be_bytes(rest[tail..tail + 2].try_into().ok()?));
+            let id_start = tail.checked_sub(id_len).filter(|start| *start > 0)?;
+            Place::Row(partition, &rest[..id_start], &rest[id_start..tail], ordinal)
         }
         _ => return None,
     };
@@ -143,7 +147,7 @@ fn cmp_parsed(a: &Parsed<'_>, b: &Parsed<'_>) -> Ordering {
         .then_with(|| match (&a.place, &b.place) {
             (Place::Row(_, a_key, a_id, a_ordinal), Place::Row(_, b_key, b_id, b_ordinal)) => {
                 crate::collate::cmp_split(a_key, b_key)
-                    .then_with(|| a_id.as_bytes().cmp(b_id.as_bytes()))
+                    .then_with(|| a_id.cmp(b_id))
                     .then_with(|| a_ordinal.cmp(b_ordinal))
             }
             _ => Ordering::Equal,
@@ -153,14 +157,6 @@ fn cmp_parsed(a: &Parsed<'_>, b: &Parsed<'_>) -> Ordering {
 fn take_text(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let len = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
     Some((bytes.get(2..2 + len)?, &bytes[2 + len..]))
-}
-
-fn whole_text(bytes: &[u8]) -> Option<&str> {
-    let (text, rest) = take_text(bytes)?;
-    if !rest.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(text).ok()
 }
 
 fn put_text(text: &[u8], out: &mut Vec<u8>) -> Result<(), JsError> {
@@ -199,7 +195,10 @@ pub(crate) fn row_key(
     out.push(ROW);
     put_text(partition.as_bytes(), &mut out)?;
     crate::collate::encode_into(key, &mut out);
-    put_text(id.as_bytes(), &mut out)?;
+    let id_len = u16::try_from(id.len())
+        .map_err(|_| JsError::Index(format!("view key part of {} bytes", id.len())))?;
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&id_len.to_be_bytes());
     out.extend_from_slice(&ordinal.to_be_bytes());
     Ok(out)
 }
@@ -215,10 +214,16 @@ pub(crate) fn read_row_key(bytes: &[u8]) -> Result<RowKey<'_>, JsError> {
     let damaged = || JsError::Index("view index: damaged row key".to_string());
     let parsed = parse(bytes).ok_or_else(damaged)?;
     match parsed.place {
-        Place::Row(_, key, id, _) => Ok(RowKey {
-            key: crate::collate::decode(key).ok_or_else(damaged)?,
-            id,
-        }),
+        Place::Row(_, key, id, _) => {
+            // The view key is exactly one encoded value.
+            if crate::collate::split_key(key).is_none_or(|(_, rest)| !rest.is_empty()) {
+                return Err(damaged());
+            }
+            Ok(RowKey {
+                key: crate::collate::decode(key).ok_or_else(damaged)?,
+                id: std::str::from_utf8(id).map_err(|_| damaged())?,
+            })
+        }
         _ => Err(damaged()),
     }
 }

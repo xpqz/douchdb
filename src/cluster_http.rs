@@ -67,8 +67,10 @@ pub(crate) fn peer_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
 const STREAM_CONNECTION_WINDOW: u32 = 64 * crate::listener::peer_h2::STREAM_WINDOW;
 
 /// The client for peer replies read as they arrive, such as a view's rows,
-/// which can take longer than any fixed deadline. A peer silent for 60 s
-/// fails the read; one that keeps sending has no deadline.
+/// which can take longer than any fixed deadline. It has no deadline of its
+/// own: the reader times out a wait for the peer's next bytes (see
+/// `fabric::split_lines`), which `reqwest`'s read timeout cannot do for a
+/// reader that pauses.
 ///
 /// It is HTTP/2 like `peer_client`, so a stream the reader drops part way
 /// (a merge that has its page) is cancelled on its own and the connection
@@ -77,9 +79,7 @@ const STREAM_CONNECTION_WINDOW: u32 = 64 * crate::listener::peer_h2::STREAM_WIND
 /// client) holds back its own stream once that stream's window is full, and
 /// the other streams on this connection only after 64 such stalls.
 pub(crate) fn peer_stream_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
-    h2_client(tls_peers, STREAM_CONNECTION_WINDOW)
-        .read_timeout(Duration::from_secs(60))
-        .build()
+    h2_client(tls_peers, STREAM_CONNECTION_WINDOW).build()
 }
 
 /// An HTTP/2 client to peers, with the flow-control windows, frame size and

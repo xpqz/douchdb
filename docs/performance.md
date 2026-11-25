@@ -430,6 +430,29 @@ What the numbers say:
   a file whose previous close did not finish its check before the process
   exited.
 
+### Index updates (#197, 2026-11-25)
+
+A profile of 20 updates of 1,000 documents each (100,000 documents, one view
+of 400,000 rows, release builds on the same machine as above) showed where
+an update went. About two thirds was the sync of the index commit: a
+key-ordered table puts changed rows on scattered pages, so a commit wrote
+about 9x the bytes of the in-memory views' commit and its sync took 2.7x as
+long. Of the rest, about 40% was comparing keys, and almost half of that was
+splitting each stored key (walking the encoded view key to find its end,
+checking ids as UTF-8).
+
+Index updates now sync at most every 60 s (see the design doc), and a stored
+key keeps its id's length at its end, so it splits without being walked.
+
+| 20 updates of 1,000 documents, then a query each | Time |
+|---|---:|
+| In memory (`4c384cc`) | 3.4 s |
+| On disk, before | 6.0–6.5 s |
+| On disk, after | 3.8–4.1 s |
+
+Builds measured 3.3 s in memory and 3.3–4.1 s on disk at this size, within
+the noise of a machine in use.
+
 ## JavaScript sandbox throughput
 
 Design-document map/reduce/search-index work can run in four places: in-process

@@ -66,6 +66,10 @@ pub struct ViewSpec {
     pub partitioned: bool,
 }
 
+/// Longest an index goes between durable commits while it is updated (see
+/// `ViewIndex::commit`). Agreed 2026-11-25 (#197).
+const INDEX_SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Page cache of each view file: fixed and small, since many can be open
 /// (up to `--max-open-indexes`); queries also lean on the operating
 /// system's file cache.
@@ -107,9 +111,16 @@ struct ViewIndex {
     /// Shard count and partitioning of the database and view: where each
     /// document's rows are stored.
     placement: Placement,
-    /// Reduce partials were committed without a sync since the last durable
-    /// commit: closing makes them durable, so they outlive a restart.
+    /// Something (reduce partials, an index update) was committed without a
+    /// sync since the last durable commit: closing makes it durable, so it
+    /// outlives a restart.
     unsynced: bool,
+    /// When the file was last known durable: opened, or committed with a
+    /// sync. An index update syncs only once `sync_every` has passed since.
+    synced_at: std::time::Instant,
+    /// How long index updates may go without a sync (`INDEX_SYNC_EVERY`;
+    /// tests set it to always or never).
+    sync_every: std::time::Duration,
     /// Per shard, what queries read on every use: the block list, and once a
     /// reduce has needed them, every block's partial and the levels above.
     /// Filled from the file under the index lock, so it always matches the
@@ -1889,6 +1900,8 @@ impl ViewIndex {
             design,
             placement: Placement::shards(1, false),
             unsynced: false,
+            synced_at: std::time::Instant::now(),
+            sync_every: INDEX_SYNC_EVERY,
             cache: Vec::new(),
         }
     }
@@ -1911,25 +1924,43 @@ impl ViewIndex {
         Ok(self.db.insert(db))
     }
 
-    /// Run `write` in one write transaction and commit it. A failure closes
-    /// the file and reopens it: redb may refuse writes after a failed commit,
-    /// and whether the commit reached the disk is only known from the file.
+    /// Run `write`, an index update, in one write transaction and commit it.
+    /// The commit syncs only when `sync_every` has passed since the file was
+    /// last durable; otherwise it is a cache write (no sync), made durable by
+    /// a later sync or on close. An index is derived from its documents, and
+    /// its rows and cursor commit together, so a crash only takes it back to
+    /// its last durable commit, from where it reads those changes again.
+    ///
+    /// A failure closes the file and reopens it: redb may refuse writes after
+    /// a failed commit, and whether the commit reached the disk is only known
+    /// from the file.
     fn commit(
         &mut self,
         write: impl FnOnce(&WriteTransaction) -> Result<(), JsError>,
     ) -> Result<(), JsError> {
+        let durable = self.synced_at.elapsed() >= self.sync_every;
         let db = self.db()?;
-        let outcome = crate::kv::begin_write(db)
-            .map_err(index_error)
-            .and_then(|txn| {
-                write(&txn)?;
-                txn.commit().map_err(index_error)
-            });
+        let txn = if durable {
+            crate::kv::begin_write(db).map_err(index_error)
+        } else {
+            crate::kv::begin_cache_write(db).map_err(index_error)
+        };
+        let outcome = txn.and_then(|txn| {
+            write(&txn)?;
+            txn.commit().map_err(index_error)
+        });
         match &outcome {
-            Ok(()) => self.unsynced = false,
+            Ok(()) if durable => self.synced(),
+            Ok(()) => self.unsynced = true,
             Err(_) => self.close_after_failed_write(),
         }
         outcome
+    }
+
+    /// Note a durable commit: everything committed before it is durable too.
+    fn synced(&mut self) {
+        self.unsynced = false;
+        self.synced_at = std::time::Instant::now();
     }
 
     /// After a failed write, close the file and reopen it: redb may refuse
@@ -2246,7 +2277,7 @@ impl ViewIndex {
         }
         self.cursor = cursor;
         self.design = design.to_string();
-        self.unsynced = false;
+        self.synced();
         self.cache.clear();
         Ok(())
     }
@@ -2322,8 +2353,8 @@ impl Drop for ViewIndex {
         let Some(db) = self.db.take() else {
             return;
         };
-        // A durable commit, even an empty one, makes the unsynced partials
-        // before it durable. A server shutting down retires its indexes too,
+        // A durable commit, even an empty one, makes the unsynced commits
+        // before it (partials, index updates) durable. A server shutting down retires its indexes too,
         // so this runs for retired ones as well.
         if self.unsynced {
             if let Ok(txn) = crate::kv::begin_write(&db) {
@@ -6153,6 +6184,8 @@ mod tests {
         for syncs in 0.. {
             let (backend, switch) = crate::kv::powercut::PowerCut::new();
             let mut index = index_over(backend);
+            // Every update syncs: this is the durable commit's test.
+            index.sync_every = std::time::Duration::ZERO;
             index
                 .rebuild(vec![row("a", "a"), row("b", "b")], before.clone(), "map|")
                 .unwrap();
@@ -6185,6 +6218,61 @@ mod tests {
             cuts += 1;
         }
         assert!(cuts > 0, "the power was never cut during the update");
+    }
+
+    /// An index update committed without a sync is lost whole to a power
+    /// cut: the reopened index is back at its last durable commit, rows,
+    /// tables and cursor in step, and reads those changes again. The next
+    /// durable commit makes the updates before it durable too.
+    #[test]
+    fn unsynced_index_updates_roll_back_whole_after_a_power_cut() {
+        let update = |index: &mut ViewIndex, key: &str, seq: u64| {
+            let mut by_doc = HashMap::new();
+            by_doc.insert("a".to_string(), vec![row("a", key)]);
+            index
+                .apply(vec!["a".to_string()], by_doc, cursor_at(seq), "map|")
+                .unwrap();
+        };
+        let reopen = |switch: &crate::kv::powercut::PowerSwitch| {
+            let mut index =
+                ViewIndex::over(crate::kv::open_with(switch.backend(), VIEW_CACHE_BYTES).unwrap())
+                    .unwrap();
+            index.check_tables().unwrap();
+            index
+        };
+        let (backend, switch) = crate::kv::powercut::PowerCut::new();
+        let mut index = index_over(backend);
+        index.sync_every = std::time::Duration::MAX;
+        index
+            .rebuild(vec![row("a", "a"), row("b", "b")], cursor_at(1), "map|")
+            .unwrap();
+        update(&mut index, "x", 2);
+        update(&mut index, "y", 3);
+        assert!(index.unsynced);
+        switch.cut();
+        drop(index);
+        let mut index = reopen(&switch);
+        assert_eq!(index.cursor, cursor_at(1));
+        let old = vec![("a".to_string(), json!("a")), ("b".to_string(), json!("b"))];
+        assert_eq!(stored(&mut index), old);
+
+        // Unsynced, then synced: both survive.
+        let (backend, switch) = crate::kv::powercut::PowerCut::new();
+        let mut index = index_over(backend);
+        index.sync_every = std::time::Duration::MAX;
+        index
+            .rebuild(vec![row("a", "a"), row("b", "b")], cursor_at(1), "map|")
+            .unwrap();
+        update(&mut index, "x", 2);
+        index.sync_every = std::time::Duration::ZERO;
+        update(&mut index, "y", 3);
+        assert!(!index.unsynced);
+        switch.cut();
+        drop(index);
+        let mut index = reopen(&switch);
+        assert_eq!(index.cursor, cursor_at(3));
+        let new = vec![("a".to_string(), json!("y")), ("b".to_string(), json!("b"))];
+        assert_eq!(stored(&mut index), new);
     }
 
     /// Reduce partials are committed without a sync. Power lost right after
@@ -6476,6 +6564,9 @@ mod tests {
         query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
             .unwrap();
+        // The newest update is synced, so it is on the file to be damaged.
+        let path = index_path(&db, "_design/d", "v");
+        index_handle(&path).await.unwrap().lock().await.sync_every = std::time::Duration::ZERO;
         db.put_docs(docs(100..200, NEWEST), true).await.unwrap();
         let before = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
@@ -6484,7 +6575,6 @@ mod tests {
 
         // The file as a crash right after the newest update leaves it (a
         // clean close commits again), then damaged where only it wrote.
-        let path = index_path(&db, "_design/d", "v");
         let mut bytes = std::fs::read(&path).unwrap();
         indexes().remove(&path);
         let hits: Vec<usize> = bytes

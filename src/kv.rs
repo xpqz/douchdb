@@ -406,7 +406,8 @@ pub(crate) fn begin_write(
 }
 
 /// A write transaction for a cache: data derived from what is stored, that
-/// a crash may lose but never get wrong (a view's reduce partials). It
+/// a crash may lose but never get wrong (a view's reduce partials, and its
+/// index updates between syncs; see `view::ViewIndex::commit`). It
 /// commits without a sync (`Durability::None`): the next durable commit to
 /// the file makes it durable, and a crash before that rolls the file back to
 /// the last durable commit, without it. Nothing else may use it.
