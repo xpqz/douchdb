@@ -202,8 +202,14 @@ resolve.
 
 ## Resetting
 
-Run `seed.py` again to reset the cluster side, then press **Reset devices** on
-the page: both PouchDB copies are deleted and pulled again.
+In this order:
+
+1. Switch **both devices off**. A device that is still syncing while the
+   database is recreated would push its old copy, edits and conflicts
+   included, straight back into the new one.
+2. Run `seed.py` again to reset the cluster side.
+3. Press **Reset devices**: both PouchDB copies are deleted.
+4. Switch both devices back on: each pulls the fresh database.
 
 ## Running the automated check
 

@@ -159,7 +159,9 @@ reference.
   other leaf, in one `bulkDocs`; that resolution then syncs like any edit.
 - **Reset.** Re-running the seed script resets the cluster side; the page's
   Reset button destroys both PouchDBs and pulls again. The tutorial does the
-  two together before a second run.
+  two together before a second run, with both devices switched off while the
+  script runs (a syncing device would push its old copy into the new
+  database).
 
 ### Files
 
