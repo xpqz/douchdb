@@ -507,6 +507,9 @@ struct RunWindow {
     len: u64,
 }
 
+/// Most blocks a `DiskRun` keeps read (about 5 KB each at `BLOCK_ROWS`).
+const RUN_BLOCKS: usize = 256;
+
 /// A run as a selection reads it. Position lookups cannot fail in the
 /// `Positions` interface, so the first read error is kept here and returned
 /// once the selection is done.
@@ -514,22 +517,56 @@ struct DiskRun<'v, T> {
     table: &'v T,
     window: RunWindow,
     error: std::cell::RefCell<Option<JsError>>,
+    /// Blocks read whole by this run, by index (at most `RUN_BLOCKS`): a
+    /// search narrows to one block and probes it several times, and a group
+    /// that ends inside a block shares it with the next group's start, so
+    /// the block's entries are read once for all of them.
+    blocks_read: std::cell::RefCell<HashMap<usize, Arc<Vec<crate::view_store::StoredEntry>>>>,
 }
 
 impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> DiskRun<'_, T> {
     /// Rows `first..first + count` of the run.
     fn read(&self, first: u64, count: usize) -> Vec<Row> {
-        let read = crate::view_store::read_at(
-            self.table,
-            &self.window.blocks,
+        self.read_rows(first, count, stored_row)
+    }
+
+    /// Rows `first..first + count` of the run with only their values: their
+    /// keys and ids are left empty, for a reducer that reads values only.
+    fn read_values(&self, first: u64, count: usize) -> Vec<Row> {
+        self.read_rows(first, count, |_, value| {
+            Ok(Row {
+                id: String::new(),
+                key: Value::Null,
+                value: decode_value(value)?,
+            })
+        })
+    }
+
+    fn read_rows(
+        &self,
+        first: u64,
+        count: usize,
+        decode: impl Fn(&[u8], &[u8]) -> Result<Row, JsError>,
+    ) -> Vec<Row> {
+        let blocks = &self.window.blocks;
+        let (first, last) = (
             self.window.lo + first,
-            count,
-        )
-        .and_then(|rows| {
-            rows.iter()
-                .map(|(key, value)| stored_row(key, value))
-                .collect()
-        });
+            self.window.lo + first + count as u64,
+        );
+        // Rows inside one block come from the block, read whole once.
+        let one_block = crate::view_store::block_of(blocks, first)
+            .filter(|&block| count > 0 && last <= blocks.end(block));
+        let read = match one_block {
+            Some(block) => self.block_entries(block).and_then(|entries| {
+                let skip = usize::try_from(first - blocks.start(block)).map_err(index_error)?;
+                entries[skip..skip + count]
+                    .iter()
+                    .map(|(key, value)| decode(key, value))
+                    .collect()
+            }),
+            None => crate::view_store::read_at(self.table, blocks, first, count)
+                .and_then(|rows| rows.iter().map(|(key, value)| decode(key, value)).collect()),
+        };
         match read {
             Ok(rows) => rows,
             Err(error) => {
@@ -542,18 +579,17 @@ impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> DiskRun<'_, T>
     /// The id and key of the shard's row at position `at` (its value is not
     /// read: searches only compare keys and ids).
     fn key_row(&self, at: u64) -> Option<Row> {
-        let read =
-            crate::view_store::read_key_at(self.table, &self.window.blocks, at).and_then(|key| {
-                key.map(|key| {
-                    let read = crate::view_store::read_row_key(&key)?;
-                    Ok(Row {
-                        id: read.id.to_string(),
-                        key: read.key,
-                        value: Value::Null,
-                    })
+        let read = self.stored_key_at(at).and_then(|key| {
+            key.map(|key| {
+                let read = crate::view_store::read_row_key(&key)?;
+                Ok(Row {
+                    id: read.id.to_string(),
+                    key: read.key,
+                    value: Value::Null,
                 })
-                .transpose()
-            });
+            })
+            .transpose()
+        });
         match read {
             Ok(row) => row,
             Err(error) => {
@@ -561,6 +597,42 @@ impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> DiskRun<'_, T>
                 None
             }
         }
+    }
+
+    /// The stored key at shard position `at`: a block's first key from the
+    /// block list's cache, any other from the block read whole.
+    fn stored_key_at(&self, at: u64) -> Result<Option<Vec<u8>>, JsError> {
+        let blocks = &self.window.blocks;
+        let Some(block) = crate::view_store::block_of(blocks, at) else {
+            return Ok(None);
+        };
+        let offset = usize::try_from(at - blocks.start(block)).map_err(index_error)?;
+        if offset == 0 && !self.blocks_read.borrow().contains_key(&block) {
+            return crate::view_store::read_key_at(self.table, blocks, at);
+        }
+        let entries = self.block_entries(block)?;
+        Ok(entries.get(offset).map(|(key, _)| key.clone()))
+    }
+
+    /// Block `block`'s entries, read whole the first time this run needs it.
+    fn block_entries(
+        &self,
+        block: usize,
+    ) -> Result<Arc<Vec<crate::view_store::StoredEntry>>, JsError> {
+        if let Some(entries) = self.blocks_read.borrow().get(&block) {
+            return Ok(Arc::clone(entries));
+        }
+        let entries = Arc::new(crate::view_store::read_block(
+            self.table,
+            &self.window.blocks,
+            block,
+        )?);
+        let mut read = self.blocks_read.borrow_mut();
+        if read.len() >= RUN_BLOCKS {
+            read.clear();
+        }
+        read.insert(block, Arc::clone(&entries));
+        Ok(entries)
     }
 
     fn into_result<V>(self, value: V) -> Result<V, JsError> {
@@ -766,6 +838,7 @@ impl DiskView {
                 table: &table,
                 window,
                 error: Default::default(),
+                blocks_read: Default::default(),
             })
             .collect();
         let selection = select_runs(&runs, query, visited);
@@ -1067,8 +1140,13 @@ fn reduce_level_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]
     let lo = run.window.lo;
     let mut row_sets: Vec<Vec<Row>> = Vec::new();
     let mut plan: Vec<Vec<Part>> = Vec::with_capacity(ranges.len());
+    let values_only = reads_values_only(reducer.source());
     let edge = |first: u64, end: u64, parts: &mut Vec<Part>, sets: &mut Vec<Vec<Row>>| {
-        let rows = run.read(first - lo, (end - first) as usize);
+        let rows = if values_only {
+            run.read_values(first - lo, (end - first) as usize)
+        } else {
+            run.read(first - lo, (end - first) as usize)
+        };
         visit(visited, rows.len());
         parts.push(Part::Rows(sets.len()));
         sets.push(rows);
@@ -1167,6 +1245,15 @@ fn reduce_row_sets(sets: &[Vec<Row>], reducer: &mut JsReducer) -> Result<Vec<Val
             .collect();
     }
     reducer.call_many(sets.iter().map(|rows| ReduceCall::rows(rows.iter())))
+}
+
+/// Whether `source`, a reduce function, reads only its rows' values (a
+/// built-in that ignores keys and ids), so rows read for it need no keys.
+fn reads_values_only(source: &str) -> bool {
+    matches!(
+        Builtin::parse(source),
+        Some(Builtin::Count | Builtin::Sum | Builtin::Stats | Builtin::Top(_) | Builtin::Bottom(_))
+    )
 }
 
 fn reduce_rows<'a>(
@@ -2020,6 +2107,7 @@ impl ViewIndex {
                     table: &by_key,
                     window,
                     error: Default::default(),
+                    blocks_read: Default::default(),
                 };
                 let ranges = query_ranges(&run, query, unique.as_deref());
                 if ranges.is_empty() {
@@ -2476,6 +2564,7 @@ async fn stream_rows(
                 table: &table,
                 window,
                 error: Default::default(),
+                blocks_read: Default::default(),
             };
             let (len, offset, ranges) = query_window(&run, &windows);
             total_rows += len;
