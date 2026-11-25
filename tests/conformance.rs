@@ -21286,7 +21286,10 @@ async fn cluster_map_views_stream_the_rows_a_single_node_returns() {
     let single = Server::start(false);
     let view = json!({
         "_id": "_design/d",
-        "views": {"v": {"map": "function (doc) {\n  emit(doc.n, doc._id.length);\n  if (doc.n % 3 === 0) { emit([doc.n, 'x'], null); emit(doc.n, 'again'); }\n  emit(doc.s, null);\n}"}}
+        "views": {
+            "v": {"map": "function (doc) {\n  emit(doc.n, doc._id.length);\n  if (doc.n % 3 === 0) { emit([doc.n, 'x'], null); emit(doc.n, 'again'); }\n  emit(doc.s, null);\n}"},
+            "r": {"map": "function (doc) { emit([doc.n, doc.s], doc._id.length); }", "reduce": "_sum"}
+        }
     });
     let docs: Vec<Value> = (0..60)
         .map(|i| json!({"_id": format!("d{i:02}"), "n": i % 7, "s": (["a", "B", "b", "é"][i % 4])}))
@@ -21325,13 +21328,37 @@ async fn cluster_map_views_stream_the_rows_a_single_node_returns() {
         "/clstream/_design/d/_view/v?update_seq=false&startkey=%5B3%5D",
         "/clstreamp/_partition/p1/_design/d/_view/v?skip=2&limit=9",
         "/clstreamp/_partition/p0/_design/d/_view/v?descending=true&include_docs=true",
+        "/clstream/_design/d/_view/v?keys=%5B3%2C%22b%22%2C3%2C99%2C1.0%5D",
+        "/clstream/_design/d/_view/v?keys=%5B3%2C%22b%22%2C3%2C1%5D&descending=true&skip=4&limit=9",
+        "/clstream/_design/d/_view/v?keys=%5B0%2C6%5D&include_docs=true",
+        "/clstream/_design/d/_view/v?keys=%5B3%5D&startkey_docid=d20",
+        "/clstreamp/_partition/p1/_design/d/_view/v?keys=%5B4%2C%22x%22%2C4%5D",
+        "/clstream/_design/d/_view/r",
+        "/clstream/_design/d/_view/r?group=true&skip=3&limit=5",
+        "/clstream/_design/d/_view/r?group_level=1&descending=true",
+        "/clstream/_design/d/_view/r?keys=%5B%5B3%2C%22b%22%5D%2C%5B1%2C%22B%22%5D%2C%5B3%2C%22b%22%5D%5D&group=true",
+        "/clstream/_design/d/_view/r?reduce=false&keys=%5B%5B3%2C%22b%22%5D%2C%5B1%2C%22B%22%5D%5D",
     ];
+    // Every node coordinates in turn: the one without the design document's
+    // shard reads it from another node.
     for path in queries {
-        let (cluster_status, cluster_body) = nodes[0].get(path).await;
         let (single_status, single_body) = single.get(path).await;
-        assert_eq!(cluster_status, StatusCode::OK, "{path}: {cluster_body}");
-        assert_eq!(cluster_status, single_status, "{path}");
-        assert_eq!(cluster_body, single_body, "{path}");
+        assert_eq!(single_status, StatusCode::OK, "{path}: {single_body}");
+        for node in &nodes {
+            let (cluster_status, cluster_body) = node.get(path).await;
+            assert_eq!(cluster_status, single_status, "{path}: {cluster_body}");
+            assert_eq!(cluster_body, single_body, "{path}");
+        }
+    }
+    let path = "/clstream/_design/d/_view/v?reduce=true";
+    let (status, single_body) = single.get(path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{single_body}");
+    for node in &nodes {
+        assert_eq!(
+            node.get(path).await,
+            (status, single_body.clone()),
+            "{path}"
+        );
     }
 }
 

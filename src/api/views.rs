@@ -448,64 +448,6 @@ fn restrict_to_owned_shards(req: DbRequest<'_>, query: &mut crate::view::ViewQue
     }
 }
 
-/// The reduce function a coordinator can ask the owners to run. Owners reduce
-/// their own shards and the coordinator combines the partials, instead of
-/// shipping every map row.
-async fn combinable_reducer(
-    req: DbRequest<'_>,
-    view: IndexRef<'_>,
-    query: &crate::view::ViewQuery,
-) -> Option<String> {
-    let DbRequest {
-        st, db, headers, ..
-    } = req;
-    if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
-        return None;
-    }
-    let spec = crate::view::load_spec(db, view.ddoc, view.name)
-        .await
-        .ok()?;
-    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-    if reduce {
-        spec.reduce
-    } else {
-        None
-    }
-}
-
-/// Read the view on this node, or across the cluster for a coordinator.
-async fn run_view(
-    req: DbRequest<'_>,
-    view: IndexRef<'_>,
-    query: &crate::view::ViewQuery,
-    reducer: Option<&str>,
-) -> DbResult<crate::view::ViewReply> {
-    let DbRequest {
-        st,
-        db,
-        name: dbname,
-        headers,
-        ..
-    } = req;
-    let read = ClusterRead {
-        ctx: &st.ctx,
-        db,
-        dbname,
-        headers,
-    };
-    if let Some(reducer) = reducer {
-        cluster_reduce(read, view, query, reducer)
-            .await
-            .map(crate::view::ViewReply::Reduced)
-    } else if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
-        cluster_view(read, db.clone(), view, query).await
-    } else {
-        crate::view::query(db, view.ddoc, view.name, query)
-            .await
-            .map(crate::view::ViewReply::Reduced)
-    }
-}
-
 pub(super) async fn view_request(
     req: DbRequest<'_>,
     view: IndexRef<'_>,
@@ -531,7 +473,6 @@ pub(super) async fn view_request(
     if st.ctx.cluster.is_internal(headers) {
         restrict_to_owned_shards(req, &mut query);
     }
-    let combine_reduce = combinable_reducer(req, view, &query).await;
 
     // Taken before any index catch-up or row read, on this node and on the
     // owners it asks: a client that follows `_changes` from this token then
@@ -552,9 +493,19 @@ pub(super) async fn view_request(
     let result = if peer_stream
         || (!st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers))
     {
-        crate::view::query_stream(db.clone(), view.ddoc, view.name, &query).await
+        crate::view::query_stream(db.clone(), view.ddoc, view.name, &query, peer_stream).await
+    } else if st.ctx.cluster.is_internal(headers) {
+        crate::view::query(db, view.ddoc, view.name, &query)
+            .await
+            .map(crate::view::ViewReply::Reduced)
     } else {
-        run_view(req, view, &query, combine_reduce.as_deref()).await
+        let read = ClusterRead {
+            ctx: &st.ctx,
+            db,
+            dbname,
+            headers,
+        };
+        cluster_view(read, db.clone(), view, &query).await
     };
     if !st.ctx.cluster.is_internal(headers) {
         crate::metrics::record_engine(

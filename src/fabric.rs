@@ -2254,111 +2254,6 @@ async fn fetch_local_docs(
     fetch_remote_docs(read, node, "_local_docs", opts, Some(shards)).await
 }
 
-/// One owner's part of a cluster view query.
-#[derive(Default)]
-pub(crate) struct ViewBatch {
-    rows: Arc<Vec<crate::viewfn::Row>>,
-    docs: HashMap<String, Value>,
-    total_rows: usize,
-    offset: usize,
-}
-
-/// Merged map rows for a cluster view query, with the counts CouchDB reports.
-struct ClusterViewRows {
-    pub spec: crate::view::ViewSpec,
-    pub rows: Arc<Vec<crate::viewfn::Row>>,
-    pub docs: HashMap<String, Value>,
-    pub total_rows: usize,
-    pub offset: usize,
-}
-
-async fn fetch_view_mask(
-    read: ClusterRead<'_>,
-    view: IndexRef<'_>,
-    query: &crate::view::ViewQuery,
-    spec: &crate::view::ViewSpec,
-    limit: Option<usize>,
-    node: usize,
-    mask: &ShardMask,
-) -> DbResult<ViewBatch> {
-    let ClusterRead {
-        ctx,
-        db,
-        dbname,
-        headers,
-    } = read;
-    let IndexRef {
-        ddoc,
-        name: view_name,
-    } = view;
-    if mask.is_empty() {
-        return Ok(ViewBatch::default());
-    }
-    // Owners apply the key range and return at most `limit` rows from their
-    // shards; the coordinator merges and pages the union.
-    let mut local = query.clone();
-    local.skip = 0;
-    local.limit = limit.unwrap_or(usize::MAX);
-    local.owner_shards = Some(mask.clone());
-    if node == ctx.cluster.me {
-        let selection = crate::view::local_select(db, ddoc, view_name, spec, &local).await?;
-        let docs = if query.include_docs {
-            let ids = selection
-                .rows
-                .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>();
-            crate::view::docs_by_ids(db, &ids).await?
-        } else {
-            HashMap::new()
-        };
-        return Ok(ViewBatch {
-            rows: Arc::new(selection.rows),
-            docs,
-            total_rows: selection.total_rows,
-            offset: selection.offset,
-        });
-    }
-
-    let peer = &ctx.cluster.nodes[node];
-    let selected = mask.query_value();
-    let mut params = vec![
-        ("reduce", "false".to_string()),
-        ("shards", selected),
-        (
-            "include_docs",
-            if query.include_docs { "true" } else { "false" }.to_string(),
-        ),
-    ];
-    push_range_params(&mut params, query);
-    if let Some(limit) = limit.filter(|limit| *limit != usize::MAX) {
-        params.push(("limit", limit.to_string()));
-    }
-    let request = internal_request(
-        ctx,
-        reqwest::Method::GET,
-        peer,
-        &[dbname, ddoc, "_view", view_name],
-        Some(headers),
-    )
-    .query(&params);
-    let response = send_peer(request)
-        .await
-        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-    if !response.status().is_success() {
-        return Err(ApiError::new(
-            response.status().as_u16(),
-            "view_failed",
-            response.text().await.unwrap_or_default(),
-        ));
-    }
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-    Ok(decode_view_batch(value))
-}
-
 /// The key-range parameters an owner applies to its own shards.
 fn push_range_params(params: &mut Vec<(&'static str, String)>, query: &crate::view::ViewQuery) {
     if query.descending {
@@ -2369,12 +2264,7 @@ fn push_range_params(params: &mut Vec<(&'static str, String)>, query: &crate::vi
         params.push(("key", encode(key)));
     }
     if let Some(keys) = &query.keys {
-        // An owner only needs each key once: the coordinator restores the
-        // requested order and repetitions when it renders the merged result.
-        params.push((
-            "keys",
-            encode(&Value::Array(crate::view::unique_keys(keys))),
-        ));
+        params.push(("keys", encode(&Value::Array(keys.clone()))));
     }
     if let Some(start) = &query.startkey {
         params.push(("startkey", encode(start)));
@@ -2396,11 +2286,9 @@ fn push_range_params(params: &mut Vec<(&'static str, String)>, query: &crate::vi
     }
 }
 
-/// A cluster view query on its coordinator. A map query without `keys`
-/// streams: each owner streams its shards' rows in key order and the rows
-/// are merged as they arrive. A reduce whose function the owners cannot run
-/// for it, or a `keys` query (bounded by its keys), gathers the owners' rows
-/// first.
+/// A cluster view query on its coordinator. A reduce runs on the owners,
+/// which send one partial per group. A map query streams: each owner streams
+/// its shards' rows in query order and the rows are merged as they arrive.
 pub(crate) async fn cluster_view(
     read: ClusterRead<'_>,
     owned: Arc<Db>,
@@ -2410,18 +2298,14 @@ pub(crate) async fn cluster_view(
     let ddoc_doc = design_doc(read, view.ddoc).await?;
     let spec = crate::view::spec_from_doc(&ddoc_doc, view.name)?;
     crate::view::validate_view_partition(read.db, &spec, query.partition.as_deref())?;
-    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-    if reduce || query.keys.is_some() {
-        let merged = cluster_view_rows(read, view, query, spec).await?;
-        let mut query = query.clone();
-        query.total_rows_override = Some(merged.total_rows);
-        query.offset_override = Some(merged.offset);
-        return crate::view::finish(&merged.spec, merged.rows, merged.docs, &query)
-            .await
-            .map(crate::view::ViewReply::Reduced);
-    }
     crate::view::check_query(&spec, query)?;
-    cluster_view_stream(read, owned, view, query).await
+    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    match spec.reduce.as_deref().filter(|_| reduce) {
+        Some(reducer) => cluster_reduce(read, view, query, reducer)
+            .await
+            .map(crate::view::ViewReply::Reduced),
+        None => cluster_view_stream(read, owned, view, query).await,
+    }
 }
 
 /// One owner's rows for a streamed cluster view query, in query order, with
@@ -2432,10 +2316,11 @@ struct ViewLane {
     rows: futures::stream::BoxStream<'static, DbResult<Value>>,
 }
 
-/// A map query without `keys` across the cluster: every owner streams the
-/// rows of its shards in the query's range, at most `skip + limit` of them,
-/// and they are merged in view order, `skip` and `limit` applying to the
-/// merged rows. The owners' shard sets are disjoint, so the merge needs no
+/// A map query across the cluster: every owner streams the rows of its
+/// shards in query order, at most `skip + limit` of them, and they are
+/// merged in that order, `skip` and `limit` applying to the merged rows. For
+/// `keys`, query order is the requested keys' order (each repeat listing its
+/// rows again), and an owner tags each row with its key's place in it. The owners' shard sets are disjoint, so the merge needs no
 /// deduplication. An owner that fails before its first rows fails over to a
 /// replica, as any read does; one that fails after rows have gone out ends
 /// the reply early, as in CouchDB.
@@ -2466,9 +2351,11 @@ async fn cluster_view_stream(
     }))
 }
 
-/// The rows of several lanes, each already in view order, merged into one
-/// stream in that order, the first `skip` dropped and at most `limit` kept.
-/// A lane's error ends the merged stream with it.
+/// The rows of several lanes, each already in query order, merged into one
+/// stream in that order, the first `skip` dropped and at most `limit` kept:
+/// by the place of the row's requested key (`k`, set only for `keys`
+/// queries, and removed here), then by view order. A lane's error ends the
+/// merged stream with it.
 fn merge_view_lanes(
     lanes: Vec<futures::stream::BoxStream<'static, DbResult<Value>>>,
     descending: bool,
@@ -2497,20 +2384,21 @@ fn merge_view_lanes(
                 .enumerate()
                 .filter_map(|(at, (_, head))| head.as_ref().map(|row| (at, row)))
                 .reduce(|best, candidate| {
+                    let place = |row: &Value| row.get("k").and_then(Value::as_u64);
                     let order = view_entry_cmp(candidate.1, best.1);
-                    let better = if descending {
-                        order == std::cmp::Ordering::Greater
-                    } else {
-                        order == std::cmp::Ordering::Less
-                    };
-                    if better { candidate } else { best }
+                    let order = if descending { order.reverse() } else { order };
+                    let order = place(candidate.1).cmp(&place(best.1)).then(order);
+                    if order == std::cmp::Ordering::Less { candidate } else { best }
                 })
                 .map(|(at, _)| at);
             let Some(at) = best else {
                 break;
             };
             let (lane, head) = &mut lanes[at];
-            let row = head.take().expect("a head row");
+            let mut row = head.take().expect("a head row");
+            if let Some(row) = row.as_object_mut() {
+                row.remove("k");
+            }
             match lane.next().await {
                 Some(Ok(next)) => *head = Some(next),
                 Some(Err(error)) => {
@@ -2564,8 +2452,14 @@ async fn open_view_lane(
     if node == ctx.cluster.me {
         let mut local = query.clone();
         local.owner_shards = Some(mask.clone());
-        return match crate::view::query_stream(Arc::clone(owned), view.ddoc, view.name, &local)
-            .await?
+        return match crate::view::query_stream(
+            Arc::clone(owned),
+            view.ddoc,
+            view.name,
+            &local,
+            true,
+        )
+        .await?
         {
             crate::view::ViewReply::Rows(rows) => Ok(ViewLane {
                 total_rows: rows.total_rows,
@@ -2681,77 +2575,6 @@ fn ndjson_lines(
     lines.boxed()
 }
 
-async fn cluster_view_rows(
-    read: ClusterRead<'_>,
-    view: IndexRef<'_>,
-    query: &crate::view::ViewQuery,
-    spec: crate::view::ViewSpec,
-) -> DbResult<ClusterViewRows> {
-    let ClusterRead { ctx, db, .. } = read;
-    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-    // Owners apply the key range themselves. A reduce needs every row in it;
-    // a map query takes only the global window from each owner because the
-    // owner sets are disjoint.
-    let can_limit = !reduce;
-    let take = query.skip.saturating_add(query.limit);
-
-    let owned_by_node = preferred_shard_masks(ctx, db);
-    let limit = can_limit.then_some(take);
-
-    let spec_ref = &spec;
-    let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
-        fetch_view_mask(read, view, query, spec_ref, limit, node, &mask).await
-    })
-    .await?;
-
-    let mut counts: HashMap<String, (usize, crate::viewfn::Row)> = HashMap::new();
-    let mut docs: HashMap<String, Value> = HashMap::new();
-    let mut total_rows = 0usize;
-    let mut offset = 0usize;
-    for (_, _, batch) in values {
-        let ViewBatch {
-            rows,
-            docs: node_docs,
-            total_rows: node_total,
-            offset: node_offset,
-        } = batch;
-        total_rows += node_total;
-        offset += node_offset;
-        docs.extend(node_docs);
-        let mut local: HashMap<String, (usize, crate::viewfn::Row)> = HashMap::new();
-        for row in rows.iter() {
-            let key = row_key(row);
-            local
-                .entry(key)
-                .and_modify(|(count, _)| *count += 1)
-                .or_insert((1, row.clone()));
-        }
-        for (key, (count, row)) in local {
-            match counts.get_mut(&key) {
-                Some((existing, _)) => *existing = (*existing).max(count),
-                None => {
-                    counts.insert(key, (count, row));
-                }
-            }
-        }
-    }
-
-    let mut rows = Vec::new();
-    for (_, (count, row)) in counts {
-        for _ in 0..count {
-            rows.push(row.clone());
-        }
-    }
-    crate::view::sort_rows(&mut rows);
-    Ok(ClusterViewRows {
-        spec,
-        rows: Arc::new(rows),
-        docs,
-        total_rows,
-        offset,
-    })
-}
-
 /// The reduce each owner runs on its shards: the requested key range without
 /// paging, which applies to the merged groups. For `keys`, owners return one
 /// partial per distinct exact key, so the coordinator can rebuild the
@@ -2829,21 +2652,13 @@ async fn fetch_reduce_mask(
 
 /// Reduce on every owner and combine the partials, so only one value per
 /// group crosses the network.
-pub(crate) async fn cluster_reduce(
+async fn cluster_reduce(
     read: ClusterRead<'_>,
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
     reducer: &str,
 ) -> DbResult<Value> {
     let ClusterRead { ctx, db, .. } = read;
-    let IndexRef {
-        ddoc,
-        name: view_name,
-    } = view;
-    let ddoc_doc = design_doc(read, ddoc).await?;
-    let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
-    crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
-    crate::view::check_query(&spec, query)?;
     let owned_by_node = preferred_shard_masks(ctx, db);
     let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
         fetch_reduce_mask(read, view, query, node, &mask).await
@@ -2866,41 +2681,6 @@ pub(crate) async fn cluster_reduce(
             .map_err(|reason| crate::view::reduce_failure(&reason))
     })
     .await
-}
-
-pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {
-    let total_rows = value["total_rows"].as_u64().unwrap_or(0) as usize;
-    let offset = value["offset"].as_u64().unwrap_or(0) as usize;
-    let mut rows = Vec::new();
-    let mut docs = HashMap::new();
-    for mut row in crate::json::take_array(&mut value, "rows").unwrap_or_default() {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-            continue;
-        };
-        if let Some(doc) = row.get_mut("doc").map(Value::take) {
-            docs.insert(id.clone(), doc);
-        }
-        rows.push(crate::viewfn::Row {
-            id,
-            key: row.get_mut("key").map(Value::take).unwrap_or(Value::Null),
-            value: row.get_mut("value").map(Value::take).unwrap_or(Value::Null),
-        });
-    }
-    ViewBatch {
-        rows: Arc::new(rows),
-        docs,
-        total_rows,
-        offset,
-    }
-}
-
-pub(crate) fn row_key(row: &crate::viewfn::Row) -> String {
-    format!(
-        "{}\u{1f}{}\u{1f}{}",
-        row.id,
-        serde_json::to_string(&row.key).unwrap_or_default(),
-        serde_json::to_string(&row.value).unwrap_or_default()
-    )
 }
 
 /// The design document from this node, or from a replica when the shard that
