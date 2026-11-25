@@ -2102,6 +2102,7 @@ impl Db {
     pub(crate) async fn all_docs_stream(
         db: Arc<Db>,
         opts: &AllDocsOpts,
+        owned: Option<&ShardMask>,
     ) -> DbResult<(
         AllDocsHead,
         impl futures::Stream<Item = DbResult<DocListRow>>,
@@ -2125,7 +2126,9 @@ impl Db {
         let mut before_start = 0usize;
         let mut cursors = Vec::new();
         for (index, shard) in db.shards.iter().enumerate() {
-            if partition_shard.is_some_and(|partition| partition != index) {
+            if partition_shard.is_some_and(|partition| partition != index)
+                || owned.is_some_and(|owned| !owned.covers(index))
+            {
                 continue;
             }
             let shard_opts = opts.clone();
@@ -6827,7 +6830,7 @@ mod tests {
     /// The streamed `_all_docs` reply, assembled in the shape of `all_docs`.
     async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> DocList {
         use futures::StreamExt;
-        let (head, rows) = Db::all_docs_stream(db.clone(), opts).await.unwrap();
+        let (head, rows) = Db::all_docs_stream(db.clone(), opts, None).await.unwrap();
         let rows: Vec<DocListRow> = Box::pin(rows)
             .map(|row| row.unwrap())
             .collect::<Vec<_>>()

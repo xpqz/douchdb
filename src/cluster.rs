@@ -4,6 +4,10 @@
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
+/// Marks an internal request whose reply is streamed; see
+/// `Cluster::wants_stream`.
+pub const STREAM_HEADER: &str = "x-douchdb-stream";
+
 #[derive(Clone, Default)]
 pub struct Cluster {
     /// Base URLs, e.g. `http://127.0.0.1:5984`.
@@ -283,6 +287,14 @@ impl Cluster {
         !self.secret.is_empty()
             && headers.get("x-douchdb-forwarded").is_some()
             && self.secret_matches(headers)
+    }
+
+    /// An internal request whose coordinator reads the reply as a stream of
+    /// rows (newline-delimited JSON; see `fabric::open_peer_lane`). A header,
+    /// not a query parameter, so it cannot collide with the arguments a
+    /// client passes to a filter function.
+    pub fn wants_stream(&self, headers: &HeaderMap) -> bool {
+        self.is_internal(headers) && headers.get(STREAM_HEADER).is_some()
     }
 
     pub fn is_internal_db(&self, headers: &HeaderMap) -> bool {

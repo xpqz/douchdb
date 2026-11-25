@@ -1747,89 +1747,6 @@ pub(crate) async fn cluster_all_docs(
     })
 }
 
-/// One round of a paged cluster `_all_docs` read (no `keys`): the rows of
-/// every node merged in id order, cut where a node that returned a full page
-/// stopped, since that node may hold the ids after it. The next round starts
-/// after the last row (`after`); `more` says whether one is needed. The
-/// coordinator applies `skip` and `limit` itself, so `opts`' are ignored.
-pub(crate) struct AllDocsPage {
-    pub total_rows: u64,
-    /// Rows before the request's start key, over all nodes.
-    pub before: u64,
-    pub rows: Vec<DocListRow>,
-    pub more: bool,
-}
-
-pub(crate) async fn cluster_all_docs_page(
-    read: ClusterRead<'_>,
-    opts: &AllDocsOpts,
-    after: Option<&str>,
-    page: usize,
-) -> DbResult<AllDocsPage> {
-    let ClusterRead { ctx, db, .. } = read;
-    let owned_by_node = preferred_shard_masks(ctx, db);
-    let mut window = opts.clone();
-    window.keys = None;
-    window.skip = 0;
-    // From the last row sent: it comes back first and is dropped.
-    window.limit = page + usize::from(after.is_some());
-    if let Some(after) = after {
-        window.startkey = Some(after.to_string());
-    }
-    let window = &window;
-    let values = scatter(
-        read,
-        &owned_by_node,
-        "all_docs",
-        |node, mask, _| async move { fetch_all_docs(read, node, window, Some(&mask)).await },
-    )
-    .await?;
-    let before_bound = |id: &str, bound: &str| {
-        if opts.descending {
-            id >= bound
-        } else {
-            id <= bound
-        }
-    };
-    let (mut total_rows, mut before) = (0u64, 0u64);
-    let mut bound: Option<String> = None;
-    let mut rows: Vec<(String, DocListRow)> = Vec::new();
-    for (_, _, response) in values {
-        total_rows += response.total_rows.unwrap_or(0);
-        before += response.offset.unwrap_or(0);
-        if response.rows.len() >= window.limit {
-            if let Some(last) = response.rows.last().and_then(|row| row.id.clone()) {
-                if bound
-                    .as_deref()
-                    .is_none_or(|bound| before_bound(&last, bound))
-                {
-                    bound = Some(last);
-                }
-            }
-        }
-        for row in response.rows {
-            if let Some(id) = row.id.clone() {
-                if after != Some(id.as_str()) {
-                    rows.push((id, row));
-                }
-            }
-        }
-    }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    if opts.descending {
-        rows.reverse();
-    }
-    if let Some(bound) = &bound {
-        rows.retain(|(id, _)| before_bound(id, bound));
-    }
-    Ok(AllDocsPage {
-        total_rows,
-        before,
-        rows: rows.into_iter().map(|(_, row)| row).collect(),
-        more: bound.is_some(),
-    })
-}
-
 pub(crate) async fn fetch_all_docs(
     read: ClusterRead<'_>,
     node: usize,
@@ -1862,37 +1779,7 @@ async fn fetch_remote_docs(
         ..
     } = read;
     let peer = &ctx.cluster.nodes[node];
-    let mut query: Vec<(&str, String)> = Vec::new();
-    if let Some(shards) = shards {
-        query.push(("shards", shards.query_value()));
-    }
-    if let Some(partition) = &opts.partition {
-        query.push(("partition", partition.clone()));
-    }
-    if opts.include_docs {
-        query.push(("include_docs", "true".to_string()));
-    }
-    if opts.conflicts {
-        query.push(("conflicts", "true".to_string()));
-    }
-    if opts.descending {
-        query.push(("descending", "true".to_string()));
-    }
-    if !opts.inclusive_end {
-        query.push(("inclusive_end", "false".to_string()));
-    }
-    if opts.skip > 0 {
-        query.push(("skip", opts.skip.to_string()));
-    }
-    if opts.limit != usize::MAX {
-        query.push(("limit", opts.limit.to_string()));
-    }
-    if let Some(start) = &opts.startkey {
-        query.push(("startkey", serde_json::to_string(start).unwrap_or_default()));
-    }
-    if let Some(end) = &opts.endkey {
-        query.push(("endkey", serde_json::to_string(end).unwrap_or_default()));
-    }
+    let query = all_docs_params(opts, shards);
     let body = match &opts.keys {
         Some(keys) => json!({"keys": keys, "include_docs": opts.include_docs}),
         None => json!({}),
@@ -1923,6 +1810,107 @@ async fn fetch_remote_docs(
         .json::<DocList>()
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
+/// The query parameters of an `_all_docs`-shaped read a peer answers from
+/// the shards in `shards`.
+fn all_docs_params(opts: &AllDocsOpts, shards: Option<&ShardMask>) -> Vec<(&'static str, String)> {
+    let mut query: Vec<(&'static str, String)> = Vec::new();
+    if let Some(shards) = shards {
+        query.push(("shards", shards.query_value()));
+    }
+    if let Some(partition) = &opts.partition {
+        query.push(("partition", partition.clone()));
+    }
+    if opts.include_docs {
+        query.push(("include_docs", "true".to_string()));
+    }
+    if opts.conflicts {
+        query.push(("conflicts", "true".to_string()));
+    }
+    if opts.descending {
+        query.push(("descending", "true".to_string()));
+    }
+    if !opts.inclusive_end {
+        query.push(("inclusive_end", "false".to_string()));
+    }
+    if opts.skip > 0 {
+        query.push(("skip", opts.skip.to_string()));
+    }
+    if opts.limit != usize::MAX {
+        query.push(("limit", opts.limit.to_string()));
+    }
+    if let Some(start) = &opts.startkey {
+        query.push(("startkey", serde_json::to_string(start).unwrap_or_default()));
+    }
+    if let Some(end) = &opts.endkey {
+        query.push(("endkey", serde_json::to_string(end).unwrap_or_default()));
+    }
+    query
+}
+
+/// A cluster `_all_docs` without `keys`: every owner streams the rows of its
+/// shards in id order, at most `skip + limit` of them, and they are merged in
+/// that order as they arrive, `skip` and `limit` applying to the merged rows.
+/// It returns `total_rows`, `offset` and the rows. As for views, an owner
+/// failing before its counts are in fails over; one failing after rows
+/// have gone out ends the stream early.
+pub(crate) async fn cluster_all_docs_stream(
+    read: ClusterRead<'_>,
+    owned: Arc<Db>,
+    opts: &AllDocsOpts,
+) -> DbResult<(
+    usize,
+    usize,
+    futures::stream::BoxStream<'static, DbResult<Value>>,
+)> {
+    let owned_by_node = preferred_shard_masks(read.ctx, read.db);
+    let mut window = opts.clone();
+    window.skip = 0;
+    window.limit = opts.skip.saturating_add(opts.limit);
+    let window = &window;
+    let owned = &owned;
+    let lanes = scatter(
+        read,
+        &owned_by_node,
+        "all_docs",
+        |node, mask, _| async move {
+            if node == read.ctx.cluster.me {
+                let (head, rows) =
+                    Db::all_docs_stream(Arc::clone(owned), window, Some(&mask)).await?;
+                let rows = rows.map(|row| {
+                    row.and_then(|row| serde_json::to_value(row).map_err(ApiError::internal))
+                });
+                return Ok(RowLane {
+                    total_rows: head.total_rows,
+                    offset: head.offset,
+                    rows: rows.boxed(),
+                });
+            }
+            let params = all_docs_params(window, Some(&mask));
+            open_peer_lane(
+                read,
+                node,
+                &[read.dbname, "_all_docs"],
+                &params,
+                "all_docs_failed",
+            )
+            .await
+        },
+    )
+    .await?;
+    let total_rows: usize = lanes.iter().map(|(_, _, lane)| lane.total_rows).sum();
+    let before_start: usize = lanes.iter().map(|(_, _, lane)| lane.offset).sum();
+    let lanes: Vec<_> = lanes.into_iter().map(|(_, _, lane)| lane.rows).collect();
+    // As a single node reports it.
+    let offset = before_start.saturating_add(opts.skip).min(total_rows);
+    let rows = merge_lanes(
+        lanes,
+        id_merge_order(opts.descending),
+        opts.skip,
+        opts.limit,
+    );
+    Ok((total_rows, offset, rows))
 }
 
 /// Hand the `_local` documents of every shard to the replicas the shard gains
@@ -2308,9 +2296,9 @@ pub(crate) async fn cluster_view(
     }
 }
 
-/// One owner's rows for a streamed cluster view query, in query order, with
-/// the counts it reports for its shards.
-struct ViewLane {
+/// One owner's rows for a streamed cluster read (a view or `_all_docs`), in
+/// query order, with the counts it reports for its shards.
+struct RowLane {
     total_rows: usize,
     offset: usize,
     rows: futures::stream::BoxStream<'static, DbResult<Value>>,
@@ -2320,8 +2308,8 @@ struct ViewLane {
 /// shards in query order, at most `skip + limit` of them, and they are
 /// merged in that order, `skip` and `limit` applying to the merged rows. For
 /// `keys`, query order is the requested keys' order (each repeat listing its
-/// rows again), and an owner tags each row with its key's place in it. The owners' shard sets are disjoint, so the merge needs no
-/// deduplication. An owner that fails before its first rows fails over to a
+/// rows again), and an owner tags each row with its key's place in it. The
+/// owners' shard sets are disjoint, so the merge needs no deduplication. An owner that fails before its first rows fails over to a
 /// replica, as any read does; one that fails after rows have gone out ends
 /// the reply early, as in CouchDB.
 async fn cluster_view_stream(
@@ -2347,18 +2335,17 @@ async fn cluster_view_stream(
     Ok(crate::view::ViewReply::Rows(crate::view::MapRows {
         total_rows,
         offset: before_start + skip,
-        rows: merge_view_lanes(lanes, query.descending, skip, query.limit),
+        rows: merge_lanes(lanes, view_merge_order(query.descending), skip, query.limit),
     }))
 }
 
-/// The rows of several lanes, each already in query order, merged into one
-/// stream in that order, the first `skip` dropped and at most `limit` kept:
-/// by the place of the row's requested key (`k`, set only for `keys`
-/// queries, and removed here), then by view order. A lane's error ends the
-/// merged stream with it.
-fn merge_view_lanes(
+/// The rows of several lanes, each already in `order`, merged into one
+/// stream in that order, the first `skip` dropped and at most `limit` kept.
+/// A view row's `k` (see `view_merge_order`) is removed. A lane's error ends
+/// the merged stream with it.
+fn merge_lanes(
     lanes: Vec<futures::stream::BoxStream<'static, DbResult<Value>>>,
-    descending: bool,
+    order: impl Fn(&Value, &Value) -> std::cmp::Ordering + Send + 'static,
     skip: usize,
     limit: usize,
 ) -> futures::stream::BoxStream<'static, DbResult<Value>> {
@@ -2384,11 +2371,11 @@ fn merge_view_lanes(
                 .enumerate()
                 .filter_map(|(at, (_, head))| head.as_ref().map(|row| (at, row)))
                 .reduce(|best, candidate| {
-                    let place = |row: &Value| row.get("k").and_then(Value::as_u64);
-                    let order = view_entry_cmp(candidate.1, best.1);
-                    let order = if descending { order.reverse() } else { order };
-                    let order = place(candidate.1).cmp(&place(best.1)).then(order);
-                    if order == std::cmp::Ordering::Less { candidate } else { best }
+                    if order(candidate.1, best.1) == std::cmp::Ordering::Less {
+                        candidate
+                    } else {
+                        best
+                    }
                 })
                 .map(|(at, _)| at);
             let Some(at) = best else {
@@ -2418,6 +2405,31 @@ fn merge_view_lanes(
     rows.boxed()
 }
 
+/// The order of a streamed view query's rows: by the place of the row's
+/// requested key (`k`, set only for `keys` queries), then by view order,
+/// reversed when descending.
+fn view_merge_order(descending: bool) -> impl Fn(&Value, &Value) -> std::cmp::Ordering {
+    move |a, b| {
+        let place = |row: &Value| row.get("k").and_then(Value::as_u64);
+        let order = view_entry_cmp(a, b);
+        let order = if descending { order.reverse() } else { order };
+        place(a).cmp(&place(b)).then(order)
+    }
+}
+
+/// The order of streamed `_all_docs` rows: by id, reversed when descending.
+fn id_merge_order(descending: bool) -> impl Fn(&Value, &Value) -> std::cmp::Ordering {
+    move |a, b| {
+        let id = |row: &Value| row.get("id").and_then(Value::as_str).map(str::to_owned);
+        let order = id(a).cmp(&id(b));
+        if descending {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+}
+
 /// View order for rows of a reply: by key in view collation, then by
 /// document id, as the index stores them.
 fn view_entry_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -2442,13 +2454,8 @@ async fn open_view_lane(
     query: &crate::view::ViewQuery,
     node: usize,
     mask: &ShardMask,
-) -> DbResult<ViewLane> {
-    let ClusterRead {
-        ctx,
-        dbname,
-        headers,
-        ..
-    } = read;
+) -> DbResult<RowLane> {
+    let ClusterRead { ctx, dbname, .. } = read;
     if node == ctx.cluster.me {
         let mut local = query.clone();
         local.owner_shards = Some(mask.clone());
@@ -2461,7 +2468,7 @@ async fn open_view_lane(
         )
         .await?
         {
-            crate::view::ViewReply::Rows(rows) => Ok(ViewLane {
+            crate::view::ViewReply::Rows(rows) => Ok(RowLane {
                 total_rows: rows.total_rows,
                 offset: rows.offset,
                 rows: rows.rows,
@@ -2471,10 +2478,8 @@ async fn open_view_lane(
             )),
         };
     }
-    let peer = &ctx.cluster.nodes[node];
     let mut params = vec![
         ("reduce", "false".to_string()),
-        ("stream", "true".to_string()),
         ("shards", mask.query_value()),
     ];
     if query.limit != usize::MAX {
@@ -2484,21 +2489,45 @@ async fn open_view_lane(
         params.push(("include_docs", "true".to_string()));
     }
     push_range_params(&mut params, query);
+    open_peer_lane(
+        read,
+        node,
+        &[dbname, view.ddoc, "_view", view.name],
+        &params,
+        "view_failed",
+    )
+    .await
+}
+
+/// Open a peer's stream of rows (an internal request marked with
+/// `cluster::STREAM_HEADER`): newline-delimited JSON, a line of counts, the rows, and
+/// an end line. It returns once the counts are in.
+async fn open_peer_lane(
+    read: ClusterRead<'_>,
+    node: usize,
+    segments: &[&str],
+    params: &[(&str, String)],
+    failed: &'static str,
+) -> DbResult<RowLane> {
+    let ClusterRead { ctx, headers, .. } = read;
+    let peer = &ctx.cluster.nodes[node];
     let request = crate::cluster_http::internal_request_raw(
         &ctx.stream_client,
         &ctx.cluster.secret,
         reqwest::Method::GET,
         peer,
-        &[dbname, view.ddoc, "_view", view.name],
+        segments,
     );
-    let request = crate::cluster_http::forward_client_auth(request, headers).query(&params);
+    let request = crate::cluster_http::forward_client_auth(request, headers)
+        .header(crate::cluster::STREAM_HEADER, "1")
+        .query(params);
     let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {
         return Err(ApiError::new(
             response.status().as_u16(),
-            "view_failed",
+            failed,
             response.text().await.unwrap_or_default(),
         ));
     }
@@ -2511,7 +2540,7 @@ async fn open_view_lane(
         head.get(name)
             .and_then(Value::as_u64)
             .map(|count| count as usize)
-            .ok_or_else(|| ApiError::new(502, "bad_gateway", "a view stream without counts"))
+            .ok_or_else(|| ApiError::new(502, "bad_gateway", "a peer stream without counts"))
     };
     let (total_rows, offset) = (count("total_rows")?, count("offset")?);
     // Rows up to the end marker; a stream that stops before it was cut.
@@ -2532,7 +2561,7 @@ async fn open_view_lane(
             }
         }
     };
-    Ok(ViewLane {
+    Ok(RowLane {
         total_rows,
         offset,
         rows: rows.boxed(),
@@ -2540,7 +2569,7 @@ async fn open_view_lane(
 }
 
 fn peer_stream_cut() -> ApiError {
-    ApiError::new(502, "bad_gateway", "a peer's view stream ended early")
+    ApiError::new(502, "bad_gateway", "a peer's stream ended early")
 }
 
 /// The JSON values of a newline-delimited body, one per line, read as the
