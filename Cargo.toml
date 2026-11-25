@@ -69,6 +69,8 @@ landlock = "0.4"
 
 [dev-dependencies]
 proptest = "1"
+# Paused time, for tests of timeouts that must not wait on the clock.
+tokio = { version = "1", features = ["test-util"] }
 
 # The wasmi interpreter is orders of magnitude slower unoptimised, which makes
 # the sandbox tests that run a large view or index through the runner take
