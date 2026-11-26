@@ -5774,6 +5774,65 @@ async fn compact_requires_a_json_content_type() {
     compacted(&s, "compactctype").await;
 }
 
+// CouchDB 3.5 calls chttpd:validate_ctype(Req, "application/json") on these
+// POSTs too (chttpd_db, chttpd_view, chttpd_misc): each answers 415
+// `bad_content_type` to a body sent as anything else, before reading it. A
+// partitioned database's `_all_docs` and views run the same handlers.
+#[tokio::test]
+async fn json_posts_require_a_json_content_type() {
+    let s = Server::start(false);
+    s.fresh_db("ctype").await;
+    let (status, _) = s.put("/ctypep?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for db in ["ctype", "ctypep"] {
+        let (status, body) = s
+            .put(
+                &format!("/{db}/_design/d"),
+                json!({"views": {"v": {"map": "function(doc) { emit(doc._id, null); }"}}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let refused = json!({
+        "error": "bad_content_type",
+        "reason": "Content-Type must be application/json"
+    });
+    let posts = [
+        ("/ctype", json!({"_id": "a"})),
+        ("/ctype/_bulk_docs", json!({"docs": [{"_id": "b"}]})),
+        ("/ctype/_bulk_get", json!({"docs": [{"id": "b"}]})),
+        ("/ctype/_revs_diff", json!({"b": ["1-x"]})),
+        ("/ctype/_purge", json!({"b": ["1-x"]})),
+        ("/ctype/_ensure_full_commit", json!({})),
+        ("/ctype/_changes", json!({"doc_ids": ["b"]})),
+        ("/ctype/_all_docs", json!({"keys": ["b"]})),
+        ("/ctype/_design_docs", json!({"keys": ["_design/d"]})),
+        ("/ctype/_local_docs", json!({"keys": ["_local/l"]})),
+        ("/ctype/_design/d/_view/v", json!({"keys": ["b"]})),
+        ("/ctypep/_partition/p/_all_docs", json!({"keys": ["p:b"]})),
+        (
+            "/ctypep/_partition/p/_design/d/_view/v",
+            json!({"keys": ["p:b"]}),
+        ),
+        ("/_dbs_info", json!({"keys": ["ctype"]})),
+    ];
+    for (path, body) in posts {
+        // No Content-Type (and no body), then a JSON body sent as text.
+        let text = vec![("content-type", "text/plain".to_string())];
+        for (sent, headers) in [(None, vec![]), (Some(body.clone()), text)] {
+            let (status, _, answer) = s.req_headers(Method::POST, path, sent, &headers).await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{path} {headers:?}: {answer}"
+            );
+            assert_eq!(answer, refused, "{path}");
+        }
+        let (status, answer) = s.post(path, body).await;
+        assert!(status.is_success(), "{path}: {status} {answer}");
+    }
+}
+
 /// `GET /db` sizes as numbers: `(file, active, external)`, after checking
 /// that the deprecated `disk_size` and `data_size` repeat `file` and
 /// `active`.

@@ -42,6 +42,9 @@ pub async fn db_root(
                 body: &body,
             };
             if method == Method::POST {
+                if let Some(response) = require_json_content_type(&headers) {
+                    return response;
+                }
                 create_doc(req, &principal).await
             } else {
                 db_info(req, &principal).await
@@ -518,6 +521,26 @@ pub async fn db_rest(
     if let Some(response) = allowed.and_then(|allowed| require_method(checked, allowed)) {
         return response;
     }
+    // The POSTs CouchDB starts with chttpd:validate_ctype(Req,
+    // "application/json"): 415 to a body sent as anything else.
+    if method == Method::POST
+        && matches!(
+            rest.as_str(),
+            "_bulk_docs"
+                | "_bulk_get"
+                | "_revs_diff"
+                | "_purge"
+                | "_compact"
+                | "_ensure_full_commit"
+                | "_changes"
+                | "_design_docs"
+                | "_local_docs"
+        )
+    {
+        if let Some(response) = require_json_content_type(&headers) {
+            return response;
+        }
+    }
 
     match rest.as_str() {
         "_bulk_docs" => return bulk_docs(req).await,
@@ -703,9 +726,6 @@ fn purge_results_to_json(results: Vec<(String, PurgeOutcome)>) -> Response {
 
 /// `POST /{db}/_compact`.
 async fn compact(req: DbRequest<'_>) -> Response {
-    if let Some(response) = require_json_content_type(req.headers) {
-        return response;
-    }
     // CouchDB answers at once and compacts in the background; `GET /db`
     // reports `compact_running` (queued included) and `_active_tasks` the
     // progress meanwhile. `--compact-concurrency` compactions run at once on

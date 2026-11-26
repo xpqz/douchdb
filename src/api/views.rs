@@ -465,6 +465,11 @@ pub(super) async fn view_request(
     if let Some(response) = require_method(method, &["GET", "POST", "HEAD"]) {
         return response;
     }
+    if *method == Method::POST {
+        if let Some(response) = require_json_content_type(headers) {
+            return response;
+        }
+    }
 
     let mut query = match parse_view_query(req, partition) {
         Ok(query) => query,
