@@ -18,7 +18,7 @@ page=$(cd "$here/../../examples/offline-explorer" && pwd)
 name=douchdb-offline-explorer-$$
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
 # Keep this tag in step with the playwright-core version in package.json.
-timeout 600 docker run --rm --init --ipc=host --name "$name" \
+timeout 600 docker run --rm --init --ipc=host --name "$name" -e WAIT_MS \
   --add-host=host.docker.internal:host-gateway \
   -v "$here":/src:ro -v "$page":/page:ro \
   mcr.microsoft.com/playwright:v1.49.1-noble \
