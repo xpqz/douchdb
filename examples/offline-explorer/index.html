@@ -316,9 +316,13 @@ async function loadState(d) {
     if (e.status !== 404) log(`${d.label}: cannot read its saved state: ${e.message}`);
   }
   if (!d.pulled) return;
-  const all = await d.db.allDocs({ include_docs: true, conflicts: true });
-  for (const row of all.rows) {
-    if (row.doc && row.doc._conflicts && !row.id.startsWith("_design/")) d.watched.add(row.id);
+  try {
+    const all = await d.db.allDocs({ include_docs: true, conflicts: true });
+    for (const row of all.rows) {
+      if (row.doc && row.doc._conflicts && !row.id.startsWith("_design/")) d.watched.add(row.id);
+    }
+  } catch (e) {
+    log(`${d.label}: cannot scan for conflicts: ${e.message}`);
   }
 }
 
@@ -761,6 +765,7 @@ async function resetDevices() {
     const d = devices[key];
     goOffline(d);
     d.changes.cancel();
+    await d.saving;
     await d.db.destroy();
     el(key, "events").textContent = "–";
     el(key, "fatal").textContent = "–";
