@@ -138,6 +138,9 @@ this device**.
   press Run query again. Nothing has left Device A.
 - The propagation timeline now follows the new revision. Only Device A holds
   it.
+- Reload the page with Device A's switch off before you press Connect. The
+  edit is still there and still counted as unsynced: it lives in the
+  browser's storage, not in the page.
 
 ## 7. Back online: watch the edit travel
 

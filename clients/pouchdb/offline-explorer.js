@@ -23,7 +23,7 @@ const [node0, node2] = [process.argv[2], process.argv[3]];
 const [user, pass] = (process.argv[4] || "admin:secret").split(":");
 const pageDir = process.env.PAGE_DIR || "/page";
 const pagePort = 8099;
-const WAIT_MS = 120000;
+const WAIT_MS = Number(process.env.WAIT_MS || 120000);
 const TYPES = { ".html": "text/html", ".js": "text/javascript" };
 
 function startPage() {
@@ -126,6 +126,56 @@ async function setOnline(tab, pane, on) {
   if ((await tab.isChecked(sel(pane, "online"))) !== on) await tab.click(sel(pane, "online"));
 }
 
+/** Fills the sign-in form and connects; `offline` lists device panes to start switched off. */
+async function signIn(tab, offline = []) {
+  await tab.fill("#node0", node0);
+  await tab.fill("#node2", node2);
+  await tab.fill("#user", user);
+  await tab.fill("#password", pass);
+  for (const d of offline) await setOnline(tab, d, false);
+}
+
+/** Waits until neither pane has a refresh in flight. */
+const settled = (tab, key) => until(`${key} refresh to finish`, () => tab.evaluate((k) => !refreshing[k], key));
+
+/** Text of the event log. */
+const logText = (tab) => tab.textContent("#log");
+
+/**
+ * Edits the record apart on each listed pane (devices offline, Remote online),
+ * then brings the devices back and waits until both list the same conflict
+ * with `losers` losing revisions. Returns the losing revisions.
+ */
+async function makeConflict(tab, notes, losers) {
+  await until("B to hold the last edit", async () => (await timelineSeen(tab, "b")) !== "");
+  await setOnline(tab, "a", false);
+  await setOnline(tab, "b", false);
+  for (const [pane, note] of Object.entries(notes)) await edit(tab, pane, { note });
+  await setOnline(tab, "a", true);
+  await setOnline(tab, "b", true);
+  for (const d of ["a", "b"]) await tab.waitForSelector(conflictRow(d));
+  const row = async (d) => [
+    await tab.textContent(`${conflictRow(d)} [data-role="winner"]`),
+    await tab.textContent(`${conflictRow(d)} [data-role="others"]`),
+  ].map((t) => t.trim());
+  await until("both devices to agree on the conflict", async () => {
+    const [a, b] = [await row("a"), await row("b")];
+    return a[0] === b[0] && a[1] === b[1] && a[1].split(" ").length === losers;
+  });
+  return (await row("a"))[1].split(" ");
+}
+
+/** Waits until neither device lists a conflict and both hold `note` with no _conflicts. */
+async function resolvedEverywhere(tab, note) {
+  for (const d of ["a", "b"]) {
+    await until(`${d} to drop the conflict`, async () => (await tab.$(conflictRow(d))) === null);
+    await until(`${d} to hold the resolution`, async () => {
+      const c = await localCopy(tab, d);
+      return c.conflicts.length === 0 && c.note === note;
+    });
+  }
+}
+
 const CHECKS = [
   ["remote_totals", async ({ tab, cluster, state }) => {
     state.count = (await cluster("/offline_demo")).doc_count - 1;
@@ -153,6 +203,49 @@ const CHECKS = [
     await tab.click(sel("remote", "reload"));
     await waitText(tab, "remote", "state", "idle");
   }],
+  ["remote_switched_off_mid_query_says_offline", async ({ tab }) => {
+    // #159: hold the remote pane's next request until the switch is off.
+    await tab.evaluate(() => {
+      const real = window.observerFetch;
+      window.__release = null;
+      // The last request of a refresh (its pick list); everything else passes.
+      window.observerFetch = (path, init) => {
+        if (!path.includes("/_view/by_fatalities")) return real(path, init);
+        window.observerFetch = real;
+        return new Promise((r) => (window.__release = r)).then(() => real(path, init));
+      };
+    });
+    await tab.click(sel("remote", "reload"));
+    await until("the held request", () => tab.evaluate(() => window.__release !== null));
+    await tab.click(sel("remote", "online"));
+    await tab.evaluate(() => window.__release());
+    await settled(tab, "remote");
+    if ((await text(tab, "remote", "state")) !== "offline") throw new Error(`state ${await text(tab, "remote", "state")}`);
+    await tab.click(sel("remote", "online"));
+    await waitText(tab, "remote", "state", "idle");
+  }],
+  ["failed_refresh_recovers", async ({ tab }) => {
+    // #155: one failing query, with a rerun queued behind it.
+    await tab.evaluate(() => {
+      const db = devices.a.db;
+      const real = db.query;
+      window.__queries = 0;
+      db.query = (...args) => {
+        window.__queries++;
+        if (window.__queries === 1) return Promise.reject(new Error("injected"));
+        return real.apply(db, args);
+      };
+      window.__restoreQuery = () => (db.query = real);
+      refresh("a");
+      refresh("a");
+    });
+    await until("the queued rerun", () => tab.evaluate(() => window.__queries >= 3));
+    await settled(tab, "a");
+    await tab.evaluate(() => window.__restoreQuery());
+    const state = await text(tab, "a", "state");
+    if (state.startsWith("error")) throw new Error(`state stuck at ${state}`);
+    if (!(await logText(tab)).includes("query failed: injected")) throw new Error("failure not logged");
+  }],
   ["offline_edit_stays_local", async ({ tab, state }) => {
     await setOnline(tab, "a", false);
     await edit(tab, "a", { fatalDelta: 1 });
@@ -172,6 +265,35 @@ const CHECKS = [
     await waitText(tab, "b", "fatal", state.fatal + 1);
     await waitText(tab, "a", "unsynced", 0);
   }],
+  ["timeline_says_when_every_copy_has_it", async ({ tab }) => {
+    // #160: polling stops once all three copies hold the revision.
+    await tab.waitForFunction(() => document.querySelector('#timeline [data-role="target"]').textContent.includes("Every copy has it"));
+  }],
+  ["timeline_counts_a_later_revision", async ({ tab }) => {
+    // #160: a copy that only ever sees a later revision still holds the followed one.
+    await setOnline(tab, "a", false);
+    await edit(tab, "a", { note: "followed" });
+    await tab.evaluate(async (id) => {
+      const doc = await devices.a.db.get(id);
+      await devices.a.db.put({ ...doc, demo_note: "written on top, outside the page" });
+    }, ID);
+    await setOnline(tab, "a", true);
+    for (const copy of ["cluster", "b"]) {
+      await until(`${copy} to count the later revision`, async () => (await timelineSeen(tab, copy)) !== "");
+    }
+  }],
+  ["stale_device_save", async ({ tab }) => {
+    // #157: B's form is opened, then A's edit arrives on B before B saves.
+    await tab.click(`${sel("b", "pick")} button[data-id="${ID}"]`);
+    await tab.waitForFunction((s) => document.querySelector(s).textContent.trim() !== "", sel("b", "record-rev"));
+    const opened = await text(tab, "b", "record-rev");
+    await edit(tab, "a", { note: "edited on A again" });
+    await until("A's edit on B", async () => (await localCopy(tab, "b")).rev !== opened);
+    await tab.fill(sel("b", "note-input"), "stale device edit");
+    await tab.click(sel("b", "save"));
+    await waitText(tab, "b", "record-msg", "changed elsewhere, reloaded");
+    if ((await text(tab, "b", "record-rev")) !== (await localCopy(tab, "b")).rev) throw new Error("B's form not reloaded");
+  }],
   ["stale_remote_edit", async ({ tab, cluster }) => {
     await tab.click(`${sel("remote", "pick")} button[data-id="${ID}"]`);
     await tab.waitForFunction((s) => document.querySelector(s).textContent.trim() !== "", sel("remote", "record-rev"));
@@ -186,36 +308,78 @@ const CHECKS = [
     const current = (await cluster(`/offline_demo/${ID}`))._rev;
     if ((await text(tab, "remote", "record-rev")) !== current) throw new Error("remote form not reloaded");
   }],
-  ["conflict_same_winner", async ({ tab, state }) => {
-    await until("B to hold A's last edit", async () => (await timelineSeen(tab, "b")) !== "");
-    await setOnline(tab, "a", false);
-    await setOnline(tab, "b", false);
-    await edit(tab, "a", { note: "from A" });
-    await edit(tab, "b", { note: "from B" });
-    await setOnline(tab, "a", true);
-    await setOnline(tab, "b", true);
-    for (const d of ["a", "b"]) await tab.waitForSelector(conflictRow(d));
-    const row = async (d) => [
-      await tab.textContent(`${conflictRow(d)} [data-role="winner"]`),
-      await tab.textContent(`${conflictRow(d)} [data-role="others"]`),
-    ].map((t) => t.trim());
-    await until("both devices to agree on the conflict", async () => {
-      const [a, b] = [await row("a"), await row("b")];
-      return a[0] === b[0] && a[1] === b[1] && a[1] !== "";
+  ["stale_remote_edit_when_reload_fails", async ({ tab }) => {
+    // #156: the 409 is real, but re-reading the record fails.
+    await tab.click(`${sel("remote", "pick")} button[data-id="${ID}"]`);
+    await tab.waitForFunction((s) => document.querySelector(s).textContent.trim() !== "", sel("remote", "record-rev"));
+    const opened = await text(tab, "remote", "record-rev");
+    await edit(tab, "a", { note: "edited on A once more" });
+    await until("A's edit to reach the cluster", async () =>
+      (await timelineRev(tab, "cluster")) === (await text(tab, "a", "record-rev")) &&
+      (await text(tab, "a", "record-rev")) !== opened);
+    await tab.evaluate(() => {
+      const real = window.observerFetch;
+      // Fail only the pane's re-read of the record (a GET without query; the timeline adds one).
+      window.observerFetch = (path, init) => {
+        if ((init && init.method === "PUT") || path.includes("?")) return real(path, init);
+        window.observerFetch = real;
+        return Promise.reject(new Error("injected"));
+      };
     });
-    state.other = (await row("a"))[1];
+    await tab.fill(sel("remote", "note-input"), "stale remote edit");
+    await tab.click(sel("remote", "save"));
+    await waitText(tab, "remote", "state", "changed elsewhere; reload failed: injected");
+    if (!(await tab.isHidden(sel("remote", "editor")))) throw new Error("stale form still shown");
+  }],
+  ["conflict_same_winner", async ({ tab, state }) => {
+    state.other = (await makeConflict(tab, { a: "from A", b: "from B" }, 1))[0];
+  }],
+  ["state_survives_a_page_reload", async ({ tab, state }) => {
+    // #158: an offline edit and an open conflict, then the page is reloaded with A offline.
+    await setOnline(tab, "a", false);
+    await edit(tab, "a", { note: "from A, before the reload" });
+    await waitText(tab, "a", "unsynced", 1);
+    await tab.reload();
+    await signIn(tab, ["a"]);
+    await tab.click("#connect");
+    await waitText(tab, "a", "events", state.count);
+    await waitText(tab, "a", "state", "offline");
+    await waitText(tab, "a", "unsynced", 1);
+    for (const d of ["a", "b"]) await tab.waitForSelector(conflictRow(d));
+    await setOnline(tab, "a", true);
+    await waitText(tab, "a", "unsynced", 0);
+    await until("B to hold A's edit", async () => (await localCopy(tab, "b")).note === "from A, before the reload");
   }],
   ["keep_resolves", async ({ tab, state }) => {
-    if (state.other.includes(" ")) throw new Error(`expected one losing revision, got ${state.other}`);
     const kept = (await localCopy(tab, "a", state.other)).note;
     await tab.click(`${conflictRow("a")} [data-keep="${state.other}"]`);
-    for (const d of ["a", "b"]) {
-      await until(`${d} to drop the conflict`, async () => (await tab.$(conflictRow(d))) === null);
-      await until(`${d} to hold the resolution`, async () => {
-        const c = await localCopy(tab, d);
-        return c.conflicts.length === 0 && c.note === kept;
-      });
-    }
+    await resolvedEverywhere(tab, kept);
+  }],
+  ["keep_resolves_two_losers", async ({ tab }) => {
+    // #163: three versions made apart (Remote online, both devices offline).
+    const losers = await makeConflict(tab, { a: "three: A", b: "three: B", remote: "three: Remote" }, 2);
+    const kept = (await localCopy(tab, "a", losers[1])).note;
+    await tab.click(`${conflictRow("a")} [data-keep="${losers[1]}"]`);
+    await resolvedEverywhere(tab, kept);
+  }],
+  ["partial_keep_failure_is_reported", async ({ tab }) => {
+    // #161: the content write lands, the deletion of the losing version fails.
+    const [loser] = await makeConflict(tab, { a: "partial: A", b: "partial: B" }, 1);
+    await tab.evaluate(() => {
+      const db = devices.a.db;
+      const real = db.bulkDocs;
+      db.bulkDocs = async (docs) => {
+        db.bulkDocs = real;
+        const done = await real.call(db, docs.slice(0, 1));
+        return [...done, ...docs.slice(1).map((d) => ({ id: d._id, rev: d._rev, error: true, message: "injected" }))];
+      };
+    });
+    await tab.click(`${conflictRow("a")} [data-keep="winner"]`);
+    await until("the partial resolution in the log", async () => (await logText(tab)).includes("partly resolved"));
+    await until("the new revision to be pushed", async () => (await text(tab, "a", "unsynced")) === "0");
+    await tab.waitForSelector(`${conflictRow("a")} [data-keep="${loser}"]`);
+    await tab.click(`${conflictRow("a")} [data-keep="winner"]`);
+    await resolvedEverywhere(tab, (await localCopy(tab, "a")).note);
   }],
   ["reset", async ({ tab }) => {
     await tab.evaluate(() => {
@@ -228,7 +392,16 @@ const CHECKS = [
       });
       obs.observe(document.body, { subtree: true, childList: true, characterData: true });
     });
-    await tab.click("#reset");
+    // #154: the device switches are locked while the copies are deleted.
+    const locked = await tab.evaluate(async () => {
+      const done = resetDevices();
+      const during = [el("a", "online").disabled, el("b", "online").disabled];
+      await done;
+      return { during, after: [el("a", "online").disabled, el("b", "online").disabled] };
+    });
+    if (locked.during.join() !== "true,true" || locked.after.join() !== "false,false") {
+      throw new Error(`switch lock ${JSON.stringify(locked)}`);
+    }
     await tab.click(sel("remote", "reload"));
     await waitText(tab, "remote", "state", "idle");
     const events = await text(tab, "remote", "events");
@@ -246,7 +419,7 @@ const CHECKS = [
 async function main() {
   const server = await startPage();
   const browser = await chromium.launch();
-  let failure = null;
+  const failures = [];
   let tab;
   try {
     tab = await browser.newPage();
@@ -254,31 +427,33 @@ async function main() {
     tab.on("console", (m) => console.log(`[page] ${m.text()}`));
     tab.on("pageerror", (e) => console.log(`[page error] ${e.message}`));
     await tab.goto(`http://127.0.0.1:${pagePort}/index.html`);
-    await tab.fill("#node0", node0);
-    await tab.fill("#node2", node2);
-    await tab.fill("#user", user);
-    await tab.fill("#password", pass);
+    await signIn(tab);
     await cutDeviceBDuringPull(tab);
     await tab.click("#connect");
     const ctx = { tab, sel, cluster, state: {} };
+    // Later checks build on earlier ones, but a failure is reported and the
+    // run goes on, so one run shows every check that fails.
     for (const [name, run] of CHECKS) {
       try {
         await run(ctx);
+        console.log(`ok - ${name}`);
       } catch (e) {
-        throw new Error(`${name}: ${e.message}`);
+        failures.push(`${name}: ${e.message.split("\n")[0]}`);
+        console.log(`not ok - ${name}: ${e.message.split("\n")[0]}`);
       }
-      console.log(`ok - ${name}`);
     }
   } catch (e) {
-    failure = e;
+    failures.push(`setup: ${e.message}`);
   }
-  if (failure) {
-    const log = tab ? await tab.textContent("#log").catch(() => "(no #log)") : "";
-    console.error(`FAILED: ${failure.message}\npage log:\n${log}`);
+  if (failures.length) {
+    const log = tab
+      ? await tab.$$eval("#log li", (items) => items.map((li) => li.textContent).join("\n")).catch(() => "(no #log)")
+      : "";
+    console.error(`FAILED (${failures.length}):\n  ${failures.join("\n  ")}\npage log:\n${log.slice(0, 4000)}`);
   }
   await browser.close();
   server.close();
-  if (failure) process.exit(1);
+  if (failures.length) process.exit(1);
   console.log("offline explorer checks passed");
   process.exit(0);
 }
