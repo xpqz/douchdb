@@ -10079,6 +10079,37 @@ async fn cluster_dbs_info_matches_db_info() {
     }
 }
 
+/// With two copies of every range, `GET /{db}` and `_dbs_info` still count
+/// one copy per range (CouchDB's fabric_db_info), on every node: neither this
+/// node's copies only nor every replica summed.
+#[tokio::test]
+async fn cluster_db_info_counts_one_copy_per_range() {
+    let nodes = start_cluster_sharded(3, 4, 2);
+    for node in &nodes {
+        node.fresh_db("onecopy").await;
+    }
+    let docs: Vec<Value> = (0..12).map(|i| json!({"_id": format!("d{i}")})).collect();
+    let (status, written) = nodes[0]
+        .post("/onecopy/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{written}");
+    let rev = written[0]["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[0].delete(&format!("/onecopy/d0?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for node in &nodes {
+        let (status, info) = node.get("/onecopy").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        assert_eq!(info["doc_count"], 11, "{}: {info}", node.base);
+        assert_eq!(info["doc_del_count"], 1, "{}: {info}", node.base);
+        let (status, many) = node.post("/_dbs_info", json!({"keys": ["onecopy"]})).await;
+        assert_eq!(status, StatusCode::OK, "{many}");
+        let listed = &many[0]["info"];
+        for field in ["sizes", "doc_count", "doc_del_count"] {
+            assert_eq!(listed[field], info[field], "{field}: {listed} vs {info}");
+        }
+    }
+}
+
 /// A cluster `_all_docs` reads the nodes a page at a time (1000 rows a node)
 /// and still lists exactly the rows an unpaged merge would: every id once, in
 /// order, with `skip`, `limit`, `descending`, `endkey` and `inclusive_end`
