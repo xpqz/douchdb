@@ -250,6 +250,10 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     if let Some(response) = require_db_access(st, principal, db, false) {
         return response;
     }
+    // Authorized first, as CouchDB's chttpd_auth_request does.
+    if let Some(response) = require_json_content_type(headers) {
+        return response;
+    }
     if let Some(response) = reject_during_rebalance(st, db, &Method::POST, "", headers) {
         return response;
     }
@@ -518,6 +522,26 @@ pub async fn db_rest(
     if let Some(response) = allowed.and_then(|allowed| require_method(checked, allowed)) {
         return response;
     }
+    // The POSTs CouchDB starts with chttpd:validate_ctype(Req,
+    // "application/json"): 415 to a body sent as anything else.
+    if method == Method::POST
+        && matches!(
+            rest.as_str(),
+            "_bulk_docs"
+                | "_bulk_get"
+                | "_revs_diff"
+                | "_purge"
+                | "_compact"
+                | "_ensure_full_commit"
+                | "_changes"
+                | "_design_docs"
+                | "_local_docs"
+        )
+    {
+        if let Some(response) = require_json_content_type(&headers) {
+            return response;
+        }
+    }
 
     match rest.as_str() {
         "_bulk_docs" => return bulk_docs(req).await,
@@ -703,9 +727,6 @@ fn purge_results_to_json(results: Vec<(String, PurgeOutcome)>) -> Response {
 
 /// `POST /{db}/_compact`.
 async fn compact(req: DbRequest<'_>) -> Response {
-    if let Some(response) = require_json_content_type(req.headers) {
-        return response;
-    }
     // CouchDB answers at once and compacts in the background; `GET /db`
     // reports `compact_running` (queued included) and `_active_tasks` the
     // progress meanwhile. `--compact-concurrency` compactions run at once on
@@ -721,10 +742,10 @@ async fn compact(req: DbRequest<'_>) -> Response {
     let queued = !req.db.compacting() && queue.insert(req.name.to_string());
     drop(queue);
     if queued {
-        tokio::spawn(run_queued_compaction(
-            Arc::clone(req.st),
-            req.name.to_string(),
-        ));
+        tokio::spawn(run_queued_compaction(QueuedCompaction {
+            st: Arc::clone(req.st),
+            name: req.name.to_string(),
+        }));
     }
     // In a cluster, every other node holding a copy compacts it too
     // (fabric:compact), each asked on its own, so neither a slow peer nor
@@ -758,19 +779,36 @@ async fn compact(req: DbRequest<'_>) -> Response {
     json(StatusCode::ACCEPTED, json!({"ok": true}))
 }
 
-/// Wait for a compaction slot, then compact `name`. Only the name waits,
-/// so a queued database can be closed meanwhile.
-async fn run_queued_compaction(st: Arc<AppState>, name: String) {
+/// A database's entry in the compaction queue, which leaves it when
+/// dropped, however the queued compaction ends (stopped, or a panic before
+/// it claims the database included), as `CompactionClaim` does for a
+/// running one.
+struct QueuedCompaction {
+    st: Arc<AppState>,
+    name: String,
+}
+
+impl Drop for QueuedCompaction {
+    fn drop(&mut self) {
+        self.st
+            .compactions_queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.name);
+    }
+}
+
+/// Wait for a compaction slot, then compact the queued database. Only the
+/// name waits, so a queued database can be closed meanwhile.
+async fn run_queued_compaction(queued: QueuedCompaction) {
+    let (st, name) = (Arc::clone(&queued.st), queued.name.clone());
     // The semaphore is never closed; were it, the compaction runs.
     let slot = st.compaction.acquire().await.ok();
     let db = st.db(&name).await;
     // Claimed before the name leaves the queue, so `GET /db` never finds
     // the compaction in neither.
     let claim = db.as_ref().ok().and_then(|db| db.claim_compaction());
-    st.compactions_queued
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&name);
+    drop(queued);
     let mut compacted = false;
     match (&db, claim) {
         (Ok(db), Some(claim)) => {
@@ -1047,6 +1085,33 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A queued compaction that never gets to run (its task stopped, or a
+    /// panic before it claims the database) leaves the queue, so the
+    /// database neither reports `compact_running` nor ignores the next
+    /// `_compact`.
+    #[tokio::test]
+    async fn a_queued_compaction_that_stops_leaves_the_queue() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-compact-stop-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 2);
+        st.create_db("stopped", false, None, None).await.unwrap();
+        let slot = Arc::clone(&st.compaction).acquire_owned().await.unwrap();
+        st.compactions_queued
+            .lock()
+            .unwrap()
+            .insert("stopped".to_string());
+        let task = tokio::spawn(run_queued_compaction(QueuedCompaction {
+            st: Arc::clone(&st),
+            name: "stopped".to_string(),
+        }));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!st.compaction_queued("stopped"));
+        drop(slot);
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
     }

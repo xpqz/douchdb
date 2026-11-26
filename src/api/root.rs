@@ -230,6 +230,11 @@ pub async fn dbs_info(
     _: AdminOnly,
     body: Bytes,
 ) -> Response {
+    if method == Method::POST {
+        if let Some(response) = require_json_content_type(&headers) {
+            return response;
+        }
+    }
     let q = query(&uri);
     let keys = if method == Method::POST {
         serde_json::from_slice::<Value>(&body)

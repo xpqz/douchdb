@@ -1600,18 +1600,34 @@ impl Db {
     }
 
     pub async fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
-        self.store_pending_shard_map(Some(map.clone())).await
+        let writing = self.lock_settings().await;
+        self.store_pending_shard_map(writing, Some(map.clone()))
+            .await
     }
 
-    /// Remove the pending shard map, durably. Nothing pending is fine.
-    pub async fn clear_pending_shard_map(&self) -> DbResult<()> {
-        self.store_pending_shard_map(None).await
+    /// Remove the pending shard map, durably, now that `settled` (the map
+    /// acknowledged or adopted) supersedes it. Nothing pending is fine. A
+    /// pending map newer than `settled`, stored meanwhile by a concurrent
+    /// update, stays: it has yet to be acknowledged.
+    pub async fn clear_pending_shard_map(&self, settled: &ShardMap) -> DbResult<()> {
+        // Checked under the lock every pending map is stored under.
+        let writing = self.lock_settings().await;
+        if self
+            .pending_shard_map()
+            .is_some_and(|pending| pending.supersedes(settled))
+        {
+            return Ok(());
+        }
+        self.store_pending_shard_map(writing, None).await
     }
 
-    async fn store_pending_shard_map(&self, map: Option<ShardMap>) -> DbResult<()> {
+    async fn store_pending_shard_map(
+        &self,
+        writing: tokio::sync::OwnedMutexGuard<()>,
+        map: Option<ShardMap>,
+    ) -> DbResult<()> {
         // A clear writes even with nothing pending in memory: a pending map
         // whose write failed yet landed may be on disk.
-        let writing = self.lock_settings().await;
         let bytes = map.as_ref().map(to_json).transpose()?;
         let pending = self.pending_shard_map.clone();
         self.store_setting(writing, PENDING_SHARD_MAP_SETTING, bytes, move || {
@@ -7424,6 +7440,40 @@ mod tests {
             .any(|(name, _)| name == PENDING_SHARD_MAP_SETTING)
     }
 
+    /// A clear settles the pending map only up to the map it names: one a
+    /// client stored meanwhile that is newer (a higher version, or the same
+    /// version that wins the tiebreak) stays pending.
+    #[tokio::test]
+    async fn a_clear_keeps_a_newer_pending_shard_map() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-pending-newer-{}", crate::util::uuid()));
+        let db = Db::open_or_create(&root, "newer", meta_config()).unwrap();
+        let map = |version, replicas: Vec<Vec<usize>>| ShardMap {
+            version,
+            replicas,
+            ..ShardMap::balanced(1, 2, 1)
+        };
+        let settled = map(4, vec![vec![0]]);
+
+        let newer = map(5, vec![vec![0]]);
+        db.set_pending_shard_map(&newer).await.unwrap();
+        db.clear_pending_shard_map(&settled).await.unwrap();
+        assert_eq!(db.pending_shard_map(), Some(newer));
+
+        let tiebreak_winner = map(4, vec![vec![1]]);
+        db.set_pending_shard_map(&tiebreak_winner).await.unwrap();
+        db.clear_pending_shard_map(&settled).await.unwrap();
+        assert_eq!(db.pending_shard_map(), Some(tiebreak_winner));
+
+        for older_or_same in [map(3, vec![vec![1]]), settled.clone()] {
+            db.set_pending_shard_map(&older_or_same).await.unwrap();
+            db.clear_pending_shard_map(&settled).await.unwrap();
+            assert!(db.pending_shard_map().is_none(), "{older_or_same:?}");
+        }
+        drop(db);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// A clear with no pending map in memory still removes one on disk.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clearing_the_pending_shard_map_removes_one_memory_does_not_hold() {
@@ -7436,7 +7486,9 @@ mod tests {
         assert!(db.pending_shard_map().is_none());
         assert!(pending_map_on_disk(&db).await);
 
-        db.clear_pending_shard_map().await.unwrap();
+        db.clear_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
         assert!(db.pending_shard_map().is_none());
         assert!(!pending_map_on_disk(&db).await, "the clear left it on disk");
         drop(db);
@@ -7466,7 +7518,9 @@ mod tests {
         assert!(db.pending_shard_map().is_none());
 
         assert!(
-            db.clear_pending_shard_map().await.is_err(),
+            db.clear_pending_shard_map(&ShardMap::single(1))
+                .await
+                .is_err(),
             "a clear that wrote nothing answered ok"
         );
 
@@ -7480,7 +7534,9 @@ mod tests {
         assert!(pending_map_on_disk(&db).await, "the write landed");
         assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
 
-        db.clear_pending_shard_map().await.unwrap();
+        db.clear_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
         assert!(db.pending_shard_map().is_none());
         assert!(!pending_map_on_disk(&db).await);
         drop(db);
@@ -7983,7 +8039,9 @@ mod tests {
         };
         let db = Db::open_or_create(&root, "pending", config()).unwrap();
         // Nothing pending is not an error.
-        db.clear_pending_shard_map().await.unwrap();
+        db.clear_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
         assert!(db.pending_shard_map().is_none());
 
         db.set_pending_shard_map(&ShardMap::single(1))
@@ -7996,7 +8054,9 @@ mod tests {
 
         let db = Db::open(&root, "pending", config()).unwrap();
         assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
-        db.clear_pending_shard_map().await.unwrap();
+        db.clear_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
         assert!(db.pending_shard_map().is_none());
         drop(db);
         let closed = Db::read_closed_meta(&root, "pending", 1).unwrap().unwrap();

@@ -761,6 +761,11 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
     if let Some(response) = require_method(req.method, &["GET", "HEAD", "POST"]) {
         return response;
     }
+    if *req.method == Method::POST {
+        if let Some(response) = require_json_content_type(req.headers) {
+            return response;
+        }
+    }
     let opts = match all_docs_opts(req.db, req.q, req.method, req.body, partition) {
         Ok(opts) => opts,
         Err(error) => return fail(error),
