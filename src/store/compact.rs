@@ -10,8 +10,8 @@
 //!    key that changes after its page was read is in the journal.
 //! 3. Off the actor, the copied file is checked in full (`kv::check`), so
 //!    the shard keeps acknowledging writes meanwhile.
-//! 4. Catch-up rounds, until one is small, take the journal's keys and
-//!    re-read each from a fresh lease: present is an upsert, absent a
+//! 4. Catch-up rounds, until one is small or `CATCH_UP_ROUNDS` have run,
+//!    take the journal's keys and re-read each from a fresh lease: present is an upsert, absent a
 //!    delete. A document named by a metadata or body key is reconciled as a
 //!    whole: its metadata copied or deleted, and its bodies in the new file
 //!    made exactly its leaf bodies, so a body that stopped being a leaf
@@ -59,6 +59,10 @@ pub(crate) const TABLES: [Table; 9] = [
 const PAGE_ENTRIES: usize = 1000;
 #[cfg(test)]
 const PAGE_ENTRIES: usize = 2;
+
+/// Catch-up rounds off the actor at most; whatever the journal holds
+/// after them is caught up on the actor, writes paused.
+const CATCH_UP_ROUNDS: usize = 8;
 
 /// Bytes after which a page of the copy ends early.
 const PAGE_BYTES: usize = 4 << 20;
@@ -542,8 +546,11 @@ async fn run(handle: &ShardHandle, hook: &Hook) -> Result<()> {
         let target = Arc::new(target);
 
         // Until a round is small, as CouchDB's compactor retries until it
-        // has caught up; the last round runs on the actor.
-        loop {
+        // has caught up, but at most `CATCH_UP_ROUNDS`: writes that outpace
+        // every round would otherwise hold the compaction, and its
+        // `--compact-concurrency` slot, for good. The last round runs on
+        // the actor, writes paused, however much is left.
+        for round in 1.. {
             let Taken::Batch(keys) = handle.journal.take() else {
                 continue 'run;
             };
@@ -560,7 +567,7 @@ async fn run(handle: &ShardHandle, hook: &Hook) -> Result<()> {
                     .await?;
             }
             hook(Stage::Round);
-            if small {
+            if small || round == CATCH_UP_ROUNDS {
                 break;
             }
         }
@@ -1326,6 +1333,66 @@ mod tests {
         let swap = seen.iter().position(|stage| *stage == Stage::Swap).unwrap();
         assert_eq!(seen[swap + 1], Stage::Start, "{seen:?}");
         assert_eq!(seen.iter().filter(|s| **s == Stage::Start).count(), 2);
+        rig.close();
+    }
+
+    /// Writes that outpace every catch-up round off the actor do not hold
+    /// the compaction off forever: after `CATCH_UP_ROUNDS` rounds the rest
+    /// is caught up on the actor, writes paused, and the compaction ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_that_outpace_the_catch_up_do_not_stop_the_compaction() {
+        let rig = Rig::new("compact-outpaced");
+        rig.run(&setup()).await.unwrap();
+        let (round_tx, mut rounds) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let hook: Hook = Arc::new(move |stage| {
+            if matches!(stage, Stage::Check | Stage::Round) {
+                let _ = round_tx.send(stage);
+                let _ = resume_rx.lock().unwrap().recv();
+            }
+        });
+        let compaction = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { compact(&handle, hook).await }
+        });
+        // Every round finds more written than a small round holds (the
+        // first, what was written during the check), until well past the
+        // cap; then the writes stop, so an uncapped compaction ends too and
+        // the count tells them apart.
+        let (mut seen, mut written) = (0, 0);
+        while let Some(stage) = rounds.recv().await {
+            if stage == Stage::Round {
+                seen += 1;
+            }
+            if seen <= CATCH_UP_ROUNDS + 3 {
+                written += 1;
+                rig.run(&op(move |txn| {
+                    for n in 0..PAGE_ENTRIES + 1 {
+                        write_doc(
+                            txn,
+                            &format!("w{seen}-{n}"),
+                            false,
+                            b"{}",
+                            (1000 + seen * 10 + n) as u64,
+                        )?;
+                    }
+                    Ok(())
+                }))
+                .await
+                .unwrap();
+            }
+            resume.send(()).unwrap();
+        }
+        compaction.await.unwrap().unwrap();
+        assert_eq!(seen, CATCH_UP_ROUNDS, "catch-up rounds off the actor");
+        let docs = rig
+            .handle
+            .gate
+            .read(|txn| txn.len(Table::Meta))
+            .await
+            .unwrap();
+        assert_eq!(docs, 6 + written * (PAGE_ENTRIES as u64 + 1));
         rig.close();
     }
 
