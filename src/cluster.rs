@@ -89,6 +89,13 @@ pub struct ShardMap {
 }
 
 impl ShardMap {
+    /// Whether this map wins over `other` as nodes reconcile: a higher
+    /// version, or the same version and the greater placement (the
+    /// tiebreak `Db::set_shard_map` applies).
+    pub fn supersedes(&self, other: &ShardMap) -> bool {
+        (self.version, &self.replicas) > (other.version, &other.replicas)
+    }
+
     pub fn single(q: u32) -> ShardMap {
         let q = q.max(1);
         ShardMap {

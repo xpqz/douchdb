@@ -290,7 +290,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
 
     // Adopt what the peers hold, and work out who is behind.
     let mut pushes: BTreeMap<String, MetadataSync> = BTreeMap::new();
-    let mut pending: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pending: BTreeMap<String, (usize, crate::cluster::ShardMap)> = BTreeMap::new();
     for (name, mine) in &sent.summary {
         if answered.is_empty() {
             break;
@@ -317,11 +317,11 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
                 && db.set_shard_map(map.clone()).await.unwrap_or(false)
             {
                 // The adopted map supersedes (or beat the tiebreak against)
-                // any pending one: one in memory is never newer, as it is
-                // the desired map when it is the newest. The clear writes
-                // even with none in memory, for one on disk only (a write
-                // that failed yet landed).
-                if let Err(error) = db.clear_pending_shard_map().await {
+                // the pending one this sweep read; one a client stored since
+                // that is newer stays pending. The clear writes even with
+                // none in memory, for one on disk only (a write that failed
+                // yet landed).
+                if let Err(error) = db.clear_pending_shard_map(map).await {
                     tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
                 }
                 desired = map.clone();
@@ -350,7 +350,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             }
         }
         if db.pending_shard_map().is_some() {
-            pending.insert(name.clone(), current);
+            pending.insert(name.clone(), (current, desired.clone()));
         }
 
         let (mut version, mut security) = db.security_versioned();
@@ -421,21 +421,22 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
     for (_, reply) in &pushed {
         for (name, accepted) in reply.iter().flat_map(|reply| reply.accepted.iter()) {
             if accepted.shard_map {
-                if let Some(count) = pending.get_mut(name) {
+                if let Some((count, _)) = pending.get_mut(name) {
                     *count += 1;
                 }
             }
         }
     }
     let quorum_floor = ctx.cluster.nodes.len().max(1) / 2;
-    for (name, acknowledgements) in &pending {
+    for (name, (acknowledgements, acknowledged)) in &pending {
         if *acknowledgements <= quorum_floor {
             continue;
         }
         let Ok(db) = state.db_cold(name).await else {
             continue;
         };
-        if let Err(error) = db.clear_pending_shard_map().await {
+        // A newer pending map stored since is not the one acknowledged.
+        if let Err(error) = db.clear_pending_shard_map(acknowledged).await {
             tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
         }
         drop(db);
