@@ -16977,6 +16977,41 @@ fn users_server_args(users: &UsersFile) -> Vec<String> {
     vec!["--users-file".to_string(), users.arg()]
 }
 
+// CouchDB authorizes a database request (chttpd_auth_request's
+// db_authorization_check) before its handler checks the Content-Type, so a
+// non-member is refused, not told about the Content-Type.
+#[tokio::test]
+async fn a_non_member_is_refused_before_the_content_type_check() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let root = bearer("root-token");
+    let (status, body) = s.req_with(Method::PUT, "/ctypeauth", None, &root).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/ctypeauth/_security",
+            Some(json!({"members": {"names": ["alice"]}})),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for path in [
+        "/ctypeauth",
+        "/ctypeauth/_bulk_docs",
+        "/ctypeauth/_all_docs",
+    ] {
+        let (status, body) = s
+            .req_with(Method::POST, path, None, &bearer("bob-token"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        let (status, body) = s
+            .req_with(Method::POST, path, None, &bearer("alice-token"))
+            .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{path}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn users_file_authenticates_tokens_sessions_and_roles() {
     let users = UsersFile::new(USERS);

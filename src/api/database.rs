@@ -42,9 +42,6 @@ pub async fn db_root(
                 body: &body,
             };
             if method == Method::POST {
-                if let Some(response) = require_json_content_type(&headers) {
-                    return response;
-                }
                 create_doc(req, &principal).await
             } else {
                 db_info(req, &principal).await
@@ -251,6 +248,10 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
         ..
     } = req;
     if let Some(response) = require_db_access(st, principal, db, false) {
+        return response;
+    }
+    // Authorized first, as CouchDB's chttpd_auth_request does.
+    if let Some(response) = require_json_content_type(headers) {
         return response;
     }
     if let Some(response) = reject_during_rebalance(st, db, &Method::POST, "", headers) {
